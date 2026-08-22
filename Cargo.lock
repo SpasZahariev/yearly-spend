@@ -1876,6 +1876,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "duckdb",
+ "serde",
  "serde_json",
  "spend-core",
  "tokio",
