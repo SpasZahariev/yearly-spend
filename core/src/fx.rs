@@ -82,7 +82,10 @@ impl Fx {
             .error_for_status()?
             .json()
             .await?;
-        let rate = Self::average(&response.rates, &to)?;
+        // Frankfurter anchors a range with the day before `start`; the
+        // monthly average must cover only days of the requested month.
+        let rates = Self::in_range(&response.rates, start, end);
+        let rate = Self::average(&rates, &to)?;
 
         let first = NaiveDate::from_ymd_opt(month.year(), month.month(), 1).unwrap();
         conn.execute(
@@ -91,6 +94,21 @@ impl Fx {
             duckdb::params!(first.format("%Y-%m-%d").to_string(), from, to, rate),
         )?;
         Ok(rate)
+    }
+
+    /// Keep only the days inside `[start, end]`; malformed dates are dropped.
+    fn in_range(
+        rates: &BTreeMap<String, BTreeMap<String, f64>>,
+        start: NaiveDate,
+        end: NaiveDate,
+    ) -> BTreeMap<String, BTreeMap<String, f64>> {
+        rates
+            .iter()
+            .filter(|(day, _)| {
+                NaiveDate::parse_from_str(day, "%Y-%m-%d").is_ok_and(|d| (start..=end).contains(&d))
+            })
+            .map(|(day, day_rates)| (day.clone(), day_rates.clone()))
+            .collect()
     }
 
     /// Mean of the daily `to`-per-`from` rates across all days present.
@@ -158,6 +176,25 @@ mod tests {
         let rates = rates_fixture();
         assert!((Fx::average(&rates, "chf").unwrap() - 0.96).abs() < 1e-9);
         assert!(Fx::average(&rates, "USD").is_err());
+    }
+
+    #[test]
+    fn in_range_ignores_days_outside_the_requested_window() {
+        let mut rates = rates_fixture();
+        let mut anchor = BTreeMap::new();
+        anchor.insert("CHF".to_string(), 9.99f64);
+        rates.insert("2026-06-01".to_string(), anchor);
+        let mut bogus = BTreeMap::new();
+        bogus.insert("CHF".to_string(), 1.0f64);
+        rates.insert("not-a-date".to_string(), bogus);
+
+        let window = Fx::in_range(
+            &rates,
+            NaiveDate::from_ymd_opt(2026, 6, 2).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 6, 30).unwrap(),
+        );
+        assert_eq!(window.len(), 3);
+        assert!((Fx::average(&window, "CHF").unwrap() - 0.96).abs() < 1e-9);
     }
 
     #[test]

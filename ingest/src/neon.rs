@@ -1,20 +1,20 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::Context;
 use chrono::NaiveDate;
 use csv::StringRecord;
 use duckdb::{Connection, Transaction};
-use serde::Deserialize;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use spend_core::config::Config;
-use spend_core::llm::{Llm, Message};
-use spend_core::schema;
+
+use crate::IngestReport;
+use crate::categorize::{self, LlmCategorizable};
 
 const SOURCE: &str = "neon";
 const ACCOUNT_NAME: &str = "Neon";
-const CATEGORY_BATCH_SIZE: usize = 60;
 const REQUIRED_HEADERS: &[&str] = &["Date", "Amount", "Description", "Subject", "Category"];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -26,28 +26,6 @@ struct NeonRow {
     amount: f64,
     category: Option<String>,
     kind: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct IngestReport {
-    pub parsed_rows: usize,
-    pub inserted_or_updated_rows: usize,
-    pub skipped: bool,
-    pub llm_batches: usize,
-}
-
-#[derive(Debug, Clone)]
-struct LlmAudit {
-    context: String,
-    phase: String,
-    attempt: i64,
-    ok: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct LlmAssignment {
-    index: usize,
-    category: String,
 }
 
 pub async fn ingest_file(
@@ -69,7 +47,7 @@ pub async fn ingest_file(
     let mut rows =
         parse_csv(&bytes).with_context(|| format!("parse Neon file {}", path.display()))?;
     let parsed_rows = rows.len();
-    let audits = categorize_uncategorized(&mut rows, config).await?;
+    let audits = categorize::categorize_uncategorized(&mut rows, SOURCE, config).await?;
 
     let tx = conn.transaction()?;
     let account_id = account_id(&tx)?;
@@ -297,124 +275,23 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-async fn categorize_uncategorized(
-    rows: &mut [NeonRow],
-    config: &Config,
-) -> anyhow::Result<Vec<LlmAudit>> {
-    let pending = rows
-        .iter()
-        .enumerate()
-        .filter_map(|(index, row)| row.category.is_none().then_some(index))
-        .collect::<Vec<_>>();
-    if pending.is_empty() {
-        return Ok(Vec::new());
+impl LlmCategorizable for NeonRow {
+    fn needs_category(&self) -> bool {
+        self.category.is_none()
     }
 
-    let llm = Llm::new(config);
-    let mut audits = Vec::new();
-    for (batch_number, batch) in pending.chunks(CATEGORY_BATCH_SIZE).enumerate() {
-        let items = batch
-            .iter()
-            .enumerate()
-            .map(|(index, row_index)| {
-                let row = &rows[*row_index];
-                serde_json::json!({
-                    "index": index,
-                    "date": row.dt.format("%Y-%m-%d").to_string(),
-                    "amount": row.amount,
-                    "description": row.description,
-                    "subject": row.subject,
-                })
-            })
-            .collect::<Vec<_>>();
-        let prompt = serde_json::to_string(&items)?;
-        let taxonomy = schema::CATEGORIES
-            .iter()
-            .map(|(name, _)| *name)
-            .collect::<Vec<_>>();
-        let messages = [
-            Message::system(format!(
-                "Classify each transaction into exactly one category from this fixed taxonomy: {}. \
-                 Return only a JSON array of objects with integer `index` and string `category`. \
-                 Include exactly one object for every input item. Do not use markdown. \
-                 Choose a specific category when possible; `uncategorized` is allowed only when \
-                 the transaction cannot be classified from the supplied fields.",
-                serde_json::to_string(&taxonomy)?
-            )),
-            Message::user(format!(
-                "Classify this JSON array of Neon transactions:\n{prompt}"
-            )),
-        ];
-
-        let response = llm.complete(&messages).await.with_context(|| {
-            format!(
-                "local LLM categorization failed for Neon batch {}",
-                batch_number + 1
-            )
-        })?;
-        let assignments = parse_assignments(&response, batch.len())?;
-        for assignment in assignments {
-            let row_index = batch[assignment.index];
-            rows[row_index].category = Some(assignment.category);
-        }
-        audits.push(LlmAudit {
-            context: format!("neon category batch {}", batch_number + 1),
-            phase: "neon_category".to_string(),
-            attempt: 1,
-            ok: true,
-        });
+    fn llm_item(&self) -> serde_json::Value {
+        json!({
+            "date": self.dt.format("%Y-%m-%d").to_string(),
+            "amount": self.amount,
+            "description": self.description,
+            "subject": self.subject,
+        })
     }
 
-    Ok(audits)
-}
-
-fn parse_assignments(response: &str, expected: usize) -> anyhow::Result<Vec<LlmAssignment>> {
-    let json = response.trim();
-    let json = match json.strip_prefix("```") {
-        Some(json) => {
-            let json = json
-                .strip_prefix("json")
-                .or_else(|| json.strip_prefix("JSON"))
-                .unwrap_or(json);
-            json.trim_end_matches("```").trim()
-        }
-        None => json,
-    };
-    let assignments: Vec<LlmAssignment> =
-        serde_json::from_str(json).context("LLM categorization response was not a JSON array")?;
-    anyhow::ensure!(
-        assignments.len() == expected,
-        "LLM returned {} categories for {expected} transactions",
-        assignments.len()
-    );
-
-    let taxonomy = schema::CATEGORIES
-        .iter()
-        .map(|(name, _)| *name)
-        .collect::<HashSet<_>>();
-    let mut indexes = HashSet::new();
-    for assignment in &assignments {
-        anyhow::ensure!(
-            assignment.index < expected,
-            "LLM returned out-of-range category index {}",
-            assignment.index
-        );
-        anyhow::ensure!(
-            indexes.insert(assignment.index),
-            "LLM returned duplicate category index {}",
-            assignment.index
-        );
-        anyhow::ensure!(
-            taxonomy.contains(assignment.category.as_str()),
-            "LLM returned category outside the taxonomy: {:?}",
-            assignment.category
-        );
+    fn set_category(&mut self, category: String) {
+        self.category = Some(category);
     }
-    anyhow::ensure!(
-        indexes.len() == expected,
-        "LLM did not return every category index"
-    );
-    Ok(assignments)
 }
 
 fn file_already_ingested(conn: &Connection, source: &str, file_sha: &str) -> anyhow::Result<bool> {
@@ -588,17 +465,6 @@ mod tests {
         );
         assert!(map_category("uncategorized").unwrap().is_none());
         assert!(map_category("new-neon-label").is_err());
-    }
-
-    #[test]
-    fn llm_response_is_validated_against_taxonomy() {
-        let parsed = parse_assignments(r#"[{"index":0,"category":"food"}]"#, 1).unwrap();
-        assert_eq!(parsed[0].category, "food");
-        let fenced =
-            parse_assignments("```json\n[{\"index\":0,\"category\":\"food\"}]\n```", 1).unwrap();
-        assert_eq!(fenced[0].category, "food");
-        assert!(parse_assignments(r#"[{"index":0,"category":"not-a-category"}]"#, 1).is_err());
-        assert!(parse_assignments(r#"[{"index":1,"category":"food"}]"#, 1).is_err());
     }
 
     #[tokio::test]

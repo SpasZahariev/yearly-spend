@@ -1,5 +1,7 @@
+mod categorize;
 mod detect;
 mod neon;
+mod revolut;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -7,6 +9,14 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use tokio::runtime::Runtime;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IngestReport {
+    pub parsed_rows: usize,
+    pub inserted_or_updated_rows: usize,
+    pub skipped: bool,
+    pub llm_batches: usize,
+}
 
 #[derive(Parser)]
 #[command(
@@ -90,11 +100,26 @@ async fn ingest(paths: &[PathBuf]) -> anyhow::Result<()> {
                     );
                 }
             }
-            detect::Source::Revolut | detect::Source::Cashback => {
+            detect::Source::Revolut => {
+                let report = revolut::ingest_file(&mut conn, &file, &config).await?;
+                if report.skipped {
+                    println!(
+                        "revolut    {} (already ingested; skipped before parsing)",
+                        file.display()
+                    );
+                } else {
+                    println!(
+                        "revolut    {} ({} rows, {} LLM batches)",
+                        file.display(),
+                        report.inserted_or_updated_rows,
+                        report.llm_batches
+                    );
+                }
+            }
+            detect::Source::Cashback => {
                 println!(
-                    "skip       {} ({} parser is not implemented yet)",
-                    file.display(),
-                    detect::detect_source(&file).name()
+                    "skip       {} (cashback parser is not implemented yet)",
+                    file.display()
                 );
             }
             detect::Source::Unknown(source) => {

@@ -21,3 +21,12 @@
 - Mapped Neon labels into the fixed taxonomy, batched uncategorized rows through the configured local LLM with taxonomy response validation, and recorded LLM audits.
 - Marked negative Neon outflows to Revolut, Swisscard AECS, and Interactive Brokers as `transfer_out`.
 - Added parser, taxonomy, transfer, LLM validation, and idempotency regression coverage.
+
+## Issue #5 - Ingest Revolut CSVs with FX conversion
+
+- Added comma-CSV Revolut parsing (unquoted) with COMPLETED-only ingestion: `REVERTED` rows dropped, exact-duplicate rows collapsed by a natural key over started/type/description/amount/currency, and fee netted into the amount so `balance` reconciles.
+- Applied the hygiene rules: `Exchange` FX-swap pairs, zero-amount `Closing transaction` rows, and `TEMP_BLOCK` rows are `internal` (never spend); `Topup` rows are `transfer_in`; other rows map to `spend`/`income` by sign and are LLM-categorized.
+- Converted non-CHF rows to CHF at the frankfurter.dev monthly average, one call per currency-month, cached in `fx_rates`; filtered out the anchor day Frankfurter prepends so averages cover only the requested month.
+- Extracted shared LLM categorization into `ingest/src/categorize.rs` (batching, taxonomy validation, audit) reused by both Neon and Revolut; moved `IngestReport` to `ingest::main`.
+- Ingested the corpus: 861 unique rows (122/231/320/188 across 2023-2026), 67 `fx_rates` rows (one per non-CHF currency-month), 0 hygiene rows in spend, 16 LLM calls with 0 failures.
+- Verified offline idempotency (re-ingest skips all files with network endpoints pointed at dead ports), and that the dashboard renders 2022-2026 with zero frontend changes and no console errors.
