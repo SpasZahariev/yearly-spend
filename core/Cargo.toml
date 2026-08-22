@@ -1,0 +1,22 @@
+[package]
+name = "spend-core"
+description = "Schema, FX, LLM client and query helpers for the yearly-spend app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "spend_core"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+dotenvy.workspace = true
+duckdb.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

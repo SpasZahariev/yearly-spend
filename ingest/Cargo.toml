@@ -1,0 +1,18 @@
+[package]
+name = "ingest"
+description = "Statement parsers and the spend CLI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "spend"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+spend-core.workspace = true
+
+[lints]
+workspace = true

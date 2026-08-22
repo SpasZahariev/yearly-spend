@@ -1,0 +1,26 @@
+[package]
+name = "spend-api"
+description = "Axum server: REST API, SSE chat and the built frontend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "spend-api"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde_json.workspace = true
+spend-core.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tower.workspace = true

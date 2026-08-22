@@ -1,0 +1,11 @@
+target/
+data/
+node_modules/
+statements/
+.env
+frontend/dist/
+frontend/node_modules/
+out.txt
+wild-home.png
+.playwright-mcp/
+ralph-once.md
