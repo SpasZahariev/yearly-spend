@@ -47,3 +47,11 @@
 - Yearly view renders per-year total bars with the selected year highlighted plus a step-quantized cumulative-spend line for the selected year; monthly view renders the 12 monthly bars with the selected month highlighted, and the day granularity renders daily bars of the selected month.
 - KPI cards and the category donut refetch for the selected period (`?year=&month=` in month view, `?year=` in year view) with period labels (e.g. `CHF · Mar 2025`); loading state derived from the pending period key, no extra render passes.
 - Verified end-to-end in a browser: rendered values for 2025/2026 (yearly, cumulative, monthly, daily, summary, categories) match direct SQL exactly; view toggle, month picker, and granularity sub-toggle switch charts as specified with the selected month highlighted; zero console errors. Full `just check` green.
+
+## Issue #8 - Currency toggle (CHF/USD/EUR)
+
+- Added `Fx::spot_rate` in `core`: one frankfurter.dev `/v1/latest?base=CHF&symbols=<to>` call returning `(rate, date)`; CHF is identity (no upstream call). Unit-tested rate extraction.
+- Added `GET /api/fx?to=` to the API: USD/EUR only (anything else is 400), returns `{from, to, rate, date}`, 500 on upstream failure. Integration tests against a counting mock frankfurter server: exactly one upstream call per hit, rejection paths make none.
+- Frontend: CHF/USD/EUR segmented toggle in the header. Every displayed number (KPI cards, all four charts, axis ticks, tooltips, donut legend) converts client-side as `value * rate` and formats as `USD 74'401.91` (Intl `de-CH`, `currencyDisplay: code`); CHF is the identity, so returning to CHF restores the API values exactly. KPI cards now render only once data is ready instead of flashing `0.00`.
+- One `/api/fx` call per currency per session: rates cached in state with in-flight request dedupe, so re-renders (year/month toggles) and re-toggles make no FX calls; on FX failure the toggle reverts to the last good currency and the error banner is set.
+- Verified end-to-end in a browser: CHF -> USD (1.2508) -> EUR (1.0692) -> CHF cycle converts and restores every visible value exactly (e.g. income `CHF 59'483.46` = SQL, `USD 74'401.91`, `EUR 63'599.72`); year switching while in USD made zero FX calls; returning to CHF made none; zero console errors. Full `just check` green.
