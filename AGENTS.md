@@ -26,6 +26,10 @@ core/        spend-core crate, shared by ingest and api
   src/config.rs    .env loading, LLM provider selection
   src/fx.rs        Frankfurter client: cached_rate (fx_rates table) + monthly average
   src/llm.rs       OpenAI-compatible chat client (local llama-server or Gemini)
+  src/chat.rs      Chat tool loop: single run_sql tool (SELECT-only via
+                   sqlparser DuckDB dialect + lexical CTE-tail guard, read-only
+                   connection, 100-row / 8-round caps), local + Gemini SSE
+                   streaming, pinned selection context in the system prompt
   src/queries.rs   Read-only year-scoped queries: summary, monthly_spend,
                    category_breakdown, meta, list_transactions/get_transaction;
                    set_transaction + kind_for_transfer for inline overrides
@@ -38,10 +42,14 @@ ingest/      `spend` CLI (cargo run -p ingest -- ingest <paths>)
 api/         Axum server on 127.0.0.1:3000
   src/main.rs      /api/meta, /api/summary, /api/series/*, /api/categories
                    (all take ?year=), /api/transactions (GET list + PATCH
-                   override); serves frontend/dist as an SPA fallback
+                   override), /api/chat (POST, SSE); serves frontend/dist as an
+                   SPA fallback
 frontend/    Vite app; src/App.tsx is the dashboard (KPI cards, Recharts bar +
-             donut, year picker); src/components/TransactionsTable.tsx =
-             inline-override table; src/components/ui = shadcn primitives
+             donut, year picker, chart-click pinning); src/components/
+             TransactionsTable.tsx = inline-override table; src/components/
+             ChatSidebar.tsx = inspector chat (chips, streaming items);
+             src/lib/chat.ts = fetch+ReadableStream SSE client; src/components/ui
+             = shadcn primitives
 statements/  CSV exports, one subdirectory per source (Neon/, Revolut/,
              cashback_cards/); source is detected from that directory name
 data/        spend.duckdb lives here (gitignored, created on first run)
@@ -94,6 +102,19 @@ data/        spend.duckdb lives here (gitignored, created on first run)
   `PATCH /api/transactions/{id}` (category and/or `is_transfer`), refetching
   the KPIs/charts after each override.
   Missing/invalid `year` -> 400.
+- **Chat**: clicking any chart element pins a selection chip (chart, series,
+  label, value, year) in the right-side inspector; chips live in per-tab React
+  state and are never persisted (reload -> empty sidebar). `POST /api/chat`
+  takes `{message, selections}` and answers `text/event-stream`: bare `data:`
+  frames are reply tokens, `event: tool` carries `{"sql": ...}`, `event: error`
+  terminates with a message. The model's only tool is `run_sql`; SQL must parse
+  as a single SELECT (sqlparser DuckDB dialect + lexical check that a WITH
+  tail is SELECT/VALUES, since sqlparser parses `WITH ... INSERT` as a query),
+  and runs on a short-lived read-only DuckDB connection. The system prompt
+  documents the schema and tells the model the dashboard's spend formula
+  (`sum(-amount_chf) FILTER (WHERE kind = 'spend')`; refund rows stored
+  positive net against spend) so its totals match the rendered numbers.
+  Handler caps: 20k-char messages, 10 selections, 180s timeout.
 
 ## End-to-end testing
 
