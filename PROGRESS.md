@@ -30,3 +30,11 @@
 - Extracted shared LLM categorization into `ingest/src/categorize.rs` (batching, taxonomy validation, audit) reused by both Neon and Revolut; moved `IngestReport` to `ingest::main`.
 - Ingested the corpus: 861 unique rows (122/231/320/188 across 2023-2026), 67 `fx_rates` rows (one per non-CHF currency-month), 0 hygiene rows in spend, 16 LLM calls with 0 failures.
 - Verified offline idempotency (re-ingest skips all files with network endpoints pointed at dead ports), and that the dashboard renders 2022-2026 with zero frontend changes and no console errors.
+
+## Issue #6 - Ingest cashback card CSV statements programmatically
+
+- Added a deterministic Swisscard AECS cashback parser (`ingest/src/cashback.rs`): fully-quoted 12-column CSV, `dd.mm.yyyy` dates, sign flip so debits are negative spend. No LLM in extraction. FX rows (EUR/GBP/USD) keep the foreign amount as `amount_orig` and the card's CHF charge as `amount_chf`, sanity-checked against the `fx_rates` cache at a 10% tolerance (card markup observed within +1.9% to +4.9%).
+- Used the export's `Merchant Category` as source of truth, mapped into the fixed taxonomy (Travel/Groceries/Food and Drink/Shopping/Entertainment/Health and Beauty/Auto/Finance). `CASHBACK` credit lines land as income; `YOUR PAYMENT (DD)` lines (category `Payment`) land as `transfer_in` funding legs excluded from spend. Labels with no taxonomy counterpart (General/Services/Family and Household) get the shared taxonomy-constrained LLM backfill.
+- Natural key = hash(card, date, normalized description, signed CHF cents) so a re-downloaded month under a new filename upserts in place; whole-file SHA skip before parsing. Each `transfer_in` is cross-validated against the paired Neon `Swisscard AECS` row (exact date + opposite amount + matching statement month); a malformed row or a validation mismatch hard-fails inside the transaction with no partial writes.
+- Ingested the corpus: 23 files, 746 raw rows -> 729 unique (17 byte-identical within-file export duplicates collapsed by the natural key), 0 null categories, 19 LLM batch calls with 0 failures. Kind split: 704 spend, 23 transfer_in, 2 income.
+- Verified end-to-end: re-ingest is a no-op (all 23 files skip before parsing); dashboard income/spend/monthly/category values for 2024/2025/2026 match direct SQL exactly; no console errors. Full `just check` green.

@@ -1,3 +1,4 @@
+mod cashback;
 mod categorize;
 mod detect;
 mod neon;
@@ -117,10 +118,20 @@ async fn ingest(paths: &[PathBuf]) -> anyhow::Result<()> {
                 }
             }
             detect::Source::Cashback => {
-                println!(
-                    "skip       {} (cashback parser is not implemented yet)",
-                    file.display()
-                );
+                let report = cashback::ingest_file(&mut conn, &file, &config).await?;
+                if report.skipped {
+                    println!(
+                        "cashback   {} (already ingested; skipped before parsing)",
+                        file.display()
+                    );
+                } else {
+                    println!(
+                        "cashback   {} ({} rows, {} LLM batches)",
+                        file.display(),
+                        report.inserted_or_updated_rows,
+                        report.llm_batches
+                    );
+                }
             }
             detect::Source::Unknown(source) => {
                 println!("skip       {} (unknown source {source})", file.display());
