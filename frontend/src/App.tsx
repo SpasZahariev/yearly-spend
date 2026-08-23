@@ -754,7 +754,7 @@ export default function App() {
         <main className="flex-1 px-6 py-8">
           <div className="mx-auto flex w-full max-w-5xl flex-col gap-6">
             {current !== null && fxReady && (
-              <div className="grid grid-cols-1 gap-6 sm:grid-cols-2">
+              <div className="grid grid-cols-1 gap-6 sm:grid-cols-3">
                 <KpiCard
                   label="income"
                   value={current.summary.income}
@@ -765,6 +765,13 @@ export default function App() {
                 <KpiCard
                   label="spend"
                   value={current.summary.spend}
+                  period={label}
+                  currency={currency}
+                  format={format}
+                />
+                <KpiCard
+                  label="moved"
+                  value={current.summary.moved}
                   period={label}
                   currency={currency}
                   format={format}

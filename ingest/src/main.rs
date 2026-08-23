@@ -2,6 +2,7 @@ mod cashback;
 mod categorize;
 mod detect;
 mod neon;
+mod pair;
 mod revolut;
 
 use std::collections::BTreeMap;
@@ -32,12 +33,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Parse statement files or directories (searched recursively)
+    /// Parse statement files or directories (searched recursively), then pair
+    /// cross-account funding transfers
     Ingest {
         /// CSV files or directories; the source is auto-detected from the parent directory name
         #[arg(required = true, value_name = "PATH")]
         paths: Vec<PathBuf>,
     },
+    /// Pair cross-account funding transfers in the existing database
+    Pair,
 }
 
 fn main() -> ExitCode {
@@ -54,7 +58,24 @@ fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Ingest { paths } => Runtime::new()?.block_on(ingest(&paths)),
+        Command::Pair => Runtime::new()?.block_on(pair()),
     }
+}
+
+async fn pair() -> anyhow::Result<()> {
+    let config = spend_core::config::Config::load()?;
+    let mut conn = spend_core::db::ingest_connection(&config.db_path)?;
+    println!("database: {}", config.db_path.display());
+    let report = pair::pair_transfers(&mut conn, &config).await?;
+    print_pairing(&report);
+    Ok(())
+}
+
+fn print_pairing(report: &pair::PairReport) {
+    println!(
+        "pairing      {} deterministic + {} LLM pairs ({} batches), {} legs still unpaired",
+        report.deterministic_pairs, report.llm_pairs, report.llm_batches, report.unpaired_legs,
+    );
 }
 
 async fn ingest(paths: &[PathBuf]) -> anyhow::Result<()> {
@@ -138,6 +159,11 @@ async fn ingest(paths: &[PathBuf]) -> anyhow::Result<()> {
             }
         }
     }
+
+    // Final phase: pair cross-account funding transfers. Runs even when every
+    // file was skipped, so a re-ingest still repairs an interrupted pairing.
+    let report = pair::pair_transfers(&mut conn, &config).await?;
+    print_pairing(&report);
 
     Ok(())
 }

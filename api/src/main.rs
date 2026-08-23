@@ -354,6 +354,9 @@ mod tests {
             ("k1", "2025-01-05", food, -100.0, "spend"),
             ("k2", "2025-01-20", income, 1000.0, "income"),
             ("k3", "2025-01-30", transfer, -50.0, "transfer_out"),
+            ("k8", "2025-01-30", transfer, 50.0, "transfer_in"),
+            // Unpaired outflow: transfer-flagged but must not count as moved.
+            ("k9", "2025-03-15", transfer, -250.0, "transfer_out"),
             ("k4", "2025-02-14", travel, -250.5, "spend"),
             ("k5", "2025-02-28", income, 2000.0, "income"),
             ("k6", "2025-12-31", food, -75.25, "spend"),
@@ -369,6 +372,18 @@ mod tests {
             )
             .unwrap();
         }
+        // Pair the k3/k8 legs; moved is the sum of groups, not of outflows.
+        conn.execute(
+            "INSERT INTO transfer_groups (from_account_id, to_account_id, amount_chf, dt)
+             VALUES (1, 2, 50.0, '2025-01-30')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE transactions SET transfer_group_id = 1 WHERE source_key IN ('k3', 'k8')",
+            [],
+        )
+        .unwrap();
     }
 
     #[tokio::test]

@@ -69,6 +69,10 @@ frontend-dev:
 ingest path="statements/":
     cargo run -p ingest -- ingest "{{ path }}"
 
+# Pair cross-account funding transfers in the existing database.
+pair:
+    cargo run -p ingest -- pair
+
 # Query the running API metadata endpoint.
 meta:
     curl --fail --silent --show-error http://127.0.0.1:3000/api/meta

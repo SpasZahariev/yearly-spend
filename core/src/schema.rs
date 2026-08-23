@@ -3,6 +3,7 @@ pub const ALL_TABLES: &[&str] = &[
     "categories",
     "transactions",
     "transfer_groups",
+    "transfer_review",
     "fx_rates",
     "ingested_files",
     "llm_calls",
@@ -56,6 +57,16 @@ CREATE TABLE IF NOT EXISTS transactions (
     file_sha VARCHAR,
     ingested_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
     UNIQUE (source, source_key)
+);
+
+-- Transfer legs whose LLM review finished. Legs left unpaired by the review
+-- are not re-reviewed on later runs; a new deterministic partner can still
+-- pair them without an LLM call. No REFERENCES clause: DuckDB forbids
+-- updating rows of a table that some other table references, and the
+-- pairing pass updates transactions.
+CREATE TABLE IF NOT EXISTS transfer_review (
+    tx_id INTEGER PRIMARY KEY,
+    reviewed_at TIMESTAMP NOT NULL DEFAULT current_timestamp
 );
 
 CREATE TABLE IF NOT EXISTS fx_rates (

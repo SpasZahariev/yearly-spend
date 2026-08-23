@@ -79,17 +79,21 @@ fn cents(value: f64) -> f64 {
     (value * 100.0).round() / 100.0
 }
 
-/// Income, spend (excl. transfer_out), moved-between-accounts, and net for a
-/// year or a single month of it. Amounts are returned as positive magnitudes in CHF.
+/// Income, spend (excluding transfer legs), moved, and net for a year or a
+/// single month of it. Amounts are returned as positive magnitudes in CHF.
+/// `moved` is the sum of paired cross-account transfers (`transfer_groups`);
+/// unpaired transfer-flagged legs count as nothing.
 pub fn summary(conn: &Connection, year: i32, month: Option<u32>) -> anyhow::Result<Summary> {
     let (income, spend, moved): (f64, f64, f64) = conn.query_row(
         "SELECT
                 COALESCE(sum(amount_chf) FILTER (kind = 'income'), 0),
                 COALESCE(sum(-amount_chf) FILTER (kind = 'spend'), 0),
-                COALESCE(sum(-amount_chf) FILTER (kind = 'transfer_out'), 0)
+                (SELECT COALESCE(sum(g.amount_chf), 0)
+                   FROM transfer_groups g
+                  WHERE year(g.dt) = ? AND (? IS NULL OR month(g.dt) = ?))
              FROM transactions
              WHERE year(dt) = ? AND (? IS NULL OR month(dt) = ?)",
-        duckdb::params![year, month, month],
+        duckdb::params![year, month, month, year, month, month],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
     let income = cents(income);
@@ -352,7 +356,8 @@ mod tests {
         assert_eq!(got.month, None);
         assert_eq!(got.income, 3000.0);
         assert_eq!(got.spend, 425.75);
-        assert_eq!(got.moved, 50.0);
+        // The transfer_out leg has no group yet: it counts as nothing.
+        assert_eq!(got.moved, 0.0);
         assert_eq!(got.net, 2574.25);
 
         let empty = summary(&conn, 2023, None).unwrap();
@@ -371,7 +376,7 @@ mod tests {
         assert_eq!(jan.month, Some(1));
         assert_eq!(jan.income, 1000.0);
         assert_eq!(jan.spend, 100.0);
-        assert_eq!(jan.moved, 50.0);
+        assert_eq!(jan.moved, 0.0);
         assert_eq!(jan.net, 900.0);
 
         let dec = summary(&conn, 2025, Some(12)).unwrap();
@@ -385,6 +390,42 @@ mod tests {
         assert_eq!(empty.spend, 0.0);
         assert_eq!(empty.moved, 0.0);
         assert_eq!(empty.net, 0.0);
+    }
+
+    #[test]
+    fn summary_moved_is_the_sum_of_paired_transfer_groups() {
+        let conn = seeded();
+        insert_sample(&conn);
+        // Pair the 2025-01-30 transfer_out leg with an arrival on account 2.
+        conn.execute(
+            "INSERT INTO transactions
+                (account_id, source, source_key, dt, description, amount_orig,
+                 currency_orig, amount_chf, kind)
+             VALUES (2, 'test', 'k8', '2025-01-30', 'in', 50.0, 'CHF', 50.0, 'transfer_in')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO transfer_groups (from_account_id, to_account_id, amount_chf, dt)
+             VALUES (1, 2, 50.0, '2025-01-30')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE transactions SET transfer_group_id = 1
+              WHERE source_key IN ('2025-01-30', 'k8')",
+            [],
+        )
+        .unwrap();
+
+        let year = summary(&conn, 2025, None).unwrap();
+        assert_eq!(year.moved, 50.0);
+        assert_eq!(year.spend, 425.75);
+        assert_eq!(year.income, 3000.0);
+        let january = summary(&conn, 2025, Some(1)).unwrap();
+        assert_eq!(january.moved, 50.0);
+        let february = summary(&conn, 2025, Some(2)).unwrap();
+        assert_eq!(february.moved, 0.0);
     }
 
     #[test]
