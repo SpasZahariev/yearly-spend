@@ -23,28 +23,44 @@ fn app(state: AppState) -> Router {
         .route("/api/meta", get(meta))
         .route("/api/summary", get(summary))
         .route("/api/series/monthly", get(monthly_series))
+        .route("/api/series/yearly", get(yearly_series))
+        .route("/api/series/cumulative", get(cumulative_series))
+        .route("/api/series/daily", get(daily_series))
         .route("/api/categories", get(categories))
         .route("/api/{*unmatched}", get(api_not_found))
         .fallback_service(spa)
         .with_state(Arc::new(state))
 }
 
+/// `year` plus an optional 1-12 `month`; `None` means the whole year.
 #[derive(Debug, Deserialize)]
-struct YearQuery {
+struct PeriodQuery {
     year: i32,
+    #[serde(default)]
+    month: Option<u32>,
 }
 
-/// Runs a year-scoped read-only query on a blocking thread and maps errors to
-/// 500s. Missing or invalid `year` query params become 400s via `Query`.
-async fn with_year(
-    State(state): State<Arc<AppState>>,
+/// `year` plus a required 1-12 `month`.
+#[derive(Debug, Deserialize)]
+struct MonthQuery {
     year: i32,
-    work: impl FnOnce(&duckdb::Connection, i32) -> anyhow::Result<serde_json::Value> + Send + 'static,
+    month: u32,
+}
+
+fn valid_month(month: u32) -> bool {
+    (1..=12).contains(&month)
+}
+
+/// Runs a read-only query on a blocking thread and maps errors to 500s.
+/// Missing or malformed `year`/`month` query params become 400s via `Query`.
+async fn run_query(
+    state: State<Arc<AppState>>,
+    work: impl FnOnce(&duckdb::Connection) -> anyhow::Result<serde_json::Value> + Send + 'static,
 ) -> Response {
     let db_path = state.db_path.clone();
     match tokio::task::spawn_blocking(move || {
         let conn = spend_core::db::api_connection(&db_path)?;
-        work(&conn, year)
+        work(&conn)
     })
     .await
     {
@@ -54,42 +70,79 @@ async fn with_year(
     }
 }
 
-async fn summary(state: State<Arc<AppState>>, query: Query<YearQuery>) -> Response {
-    with_year(state, query.year, |conn, year| {
-        let summary = spend_core::queries::summary(conn, year)?;
+async fn summary(state: State<Arc<AppState>>, query: Query<PeriodQuery>) -> Response {
+    if let Some(month) = query.month
+        && !valid_month(month)
+    {
+        return (StatusCode::BAD_REQUEST, "month must be between 1 and 12").into_response();
+    }
+    let year = query.year;
+    run_query(state, move |conn| {
+        let summary = spend_core::queries::summary(conn, year, query.month)?;
         Ok(serde_json::to_value(summary)?)
     })
     .await
 }
 
-async fn monthly_series(state: State<Arc<AppState>>, query: Query<YearQuery>) -> Response {
-    with_year(state, query.year, |conn, year| {
+async fn monthly_series(state: State<Arc<AppState>>, query: Query<PeriodQuery>) -> Response {
+    let year = query.year;
+    run_query(state, move |conn| {
         let months = spend_core::queries::monthly_spend(conn, year)?;
         Ok(serde_json::to_value(months)?)
     })
     .await
 }
 
-async fn categories(state: State<Arc<AppState>>, query: Query<YearQuery>) -> Response {
-    with_year(state, query.year, |conn, year| {
-        let slices = spend_core::queries::category_breakdown(conn, year)?;
+async fn yearly_series(state: State<Arc<AppState>>) -> Response {
+    run_query(state, |conn| {
+        let years = spend_core::queries::yearly_spend(conn)?;
+        Ok(serde_json::to_value(years)?)
+    })
+    .await
+}
+
+async fn cumulative_series(state: State<Arc<AppState>>, query: Query<PeriodQuery>) -> Response {
+    let year = query.year;
+    run_query(state, move |conn| {
+        let points = spend_core::queries::cumulative_spend(conn, year)?;
+        Ok(serde_json::to_value(points)?)
+    })
+    .await
+}
+
+async fn daily_series(state: State<Arc<AppState>>, query: Query<MonthQuery>) -> Response {
+    if !valid_month(query.month) {
+        return (StatusCode::BAD_REQUEST, "month must be between 1 and 12").into_response();
+    }
+    let year = query.year;
+    let month = query.month;
+    run_query(state, move |conn| {
+        let days = spend_core::queries::daily_spend(conn, year, month)?;
+        Ok(serde_json::to_value(days)?)
+    })
+    .await
+}
+
+async fn categories(state: State<Arc<AppState>>, query: Query<PeriodQuery>) -> Response {
+    if let Some(month) = query.month
+        && !valid_month(month)
+    {
+        return (StatusCode::BAD_REQUEST, "month must be between 1 and 12").into_response();
+    }
+    let year = query.year;
+    run_query(state, move |conn| {
+        let slices = spend_core::queries::category_breakdown(conn, year, query.month)?;
         Ok(serde_json::to_value(slices)?)
     })
     .await
 }
 
-async fn meta(State(state): State<Arc<AppState>>) -> Response {
-    let db_path = state.db_path.clone();
-    match tokio::task::spawn_blocking(move || {
-        let conn = spend_core::db::api_connection(&db_path)?;
-        spend_core::queries::meta(&conn)
+async fn meta(state: State<Arc<AppState>>) -> Response {
+    run_query(state, |conn| {
+        let meta = spend_core::queries::meta(conn)?;
+        Ok(serde_json::to_value(meta)?)
     })
     .await
-    {
-        Ok(Ok(meta)) => Json(meta).into_response(),
-        Ok(Err(err)) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
-        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
-    }
 }
 
 async fn api_not_found() -> (StatusCode, &'static str) {
@@ -249,6 +302,7 @@ mod tests {
             json,
             serde_json::json!({
                 "year": 2025,
+                "month": null,
                 "income": 3000.0,
                 "spend": 425.75,
                 "moved": 50.0,
@@ -282,6 +336,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn summary_scoped_to_a_single_month() {
+        let (dir, db) = temp_db();
+        seed_transactions(&db);
+        let app = app(AppState { db_path: db });
+        let (status, json) = get(&app, "/api/summary?year=2025&month=1").await;
+        assert_eq!(status, StatusCode::OK, "body: {json:?}");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "year": 2025,
+                "month": 1,
+                "income": 1000.0,
+                "spend": 100.0,
+                "moved": 50.0,
+                "net": 900.0
+            })
+        );
+        let (status, json) = get(&app, "/api/summary?year=2025&month=3").await;
+        assert_eq!(status, StatusCode::OK, "body: {json:?}");
+        assert_eq!(json["income"], 0.0);
+        assert_eq!(json["spend"], 0.0);
+        assert_eq!(json["net"], 0.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn yearly_series_returns_every_year_oldest_first() {
+        let (dir, db) = temp_db();
+        seed_transactions(&db);
+        let app1 = app(AppState { db_path: db });
+        let (status, json) = get(&app1, "/api/series/yearly").await;
+        assert_eq!(status, StatusCode::OK, "body: {json:?}");
+        assert_eq!(
+            json,
+            serde_json::json!([
+                { "year": 2024, "spend": 999.0 },
+                { "year": 2025, "spend": 425.75 }
+            ])
+        );
+
+        let (dir2, db2) = temp_db();
+        spend_core::db::ingest_connection(&db2).unwrap();
+        let app2 = app(AppState { db_path: db2 });
+        let (status, json) = get(&app2, "/api/series/yearly").await;
+        assert_eq!(status, StatusCode::OK, "body: {json:?}");
+        assert!(json.as_array().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[tokio::test]
+    async fn cumulative_series_runs_up_within_the_year() {
+        let (dir, db) = temp_db();
+        seed_transactions(&db);
+        let app = app(AppState { db_path: db });
+        let (status, json) = get(&app, "/api/series/cumulative?year=2025").await;
+        assert_eq!(status, StatusCode::OK, "body: {json:?}");
+        let points = json.as_array().unwrap();
+        assert_eq!(points.len(), 12);
+        assert_eq!(
+            points[0],
+            serde_json::json!({ "month": 1, "cumulative": 100.0 })
+        );
+        assert_eq!(
+            points[1],
+            serde_json::json!({ "month": 2, "cumulative": 350.5 })
+        );
+        assert_eq!(
+            points[2],
+            serde_json::json!({ "month": 3, "cumulative": 350.5 })
+        );
+        assert_eq!(
+            points[11],
+            serde_json::json!({ "month": 12, "cumulative": 425.75 })
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn daily_series_covers_every_day_of_the_month() {
+        let (dir, db) = temp_db();
+        seed_transactions(&db);
+        let app = app(AppState { db_path: db });
+        let (status, json) = get(&app, "/api/series/daily?year=2025&month=2").await;
+        assert_eq!(status, StatusCode::OK, "body: {json:?}");
+        let days = json.as_array().unwrap();
+        assert_eq!(days.len(), 28);
+        assert_eq!(days[0], serde_json::json!({ "day": 1, "spend": 0.0 }));
+        assert_eq!(days[13], serde_json::json!({ "day": 14, "spend": 250.5 }));
+        assert_eq!(days[27], serde_json::json!({ "day": 28, "spend": 0.0 }));
+
+        let (status, json) = get(&app, "/api/series/daily?year=2025&month=1").await;
+        assert_eq!(status, StatusCode::OK, "body: {json:?}");
+        let days = json.as_array().unwrap();
+        assert_eq!(days.len(), 31);
+        assert_eq!(days[4], serde_json::json!({ "day": 5, "spend": 100.0 }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn categories_scoped_to_a_single_month() {
+        let (dir, db) = temp_db();
+        seed_transactions(&db);
+        let app = app(AppState { db_path: db });
+        let (status, json) = get(&app, "/api/categories?year=2025&month=2").await;
+        assert_eq!(status, StatusCode::OK, "body: {json:?}");
+        assert_eq!(
+            json,
+            serde_json::json!([
+                {
+                    "name": "travel",
+                    "color": "#8b5cf6",
+                    "value": 250.5,
+                    "percentage": 100.0
+                }
+            ])
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn categories_returns_breakdown_with_colors_and_percentages() {
         let (dir, db) = temp_db();
         seed_transactions(&db);
@@ -309,15 +484,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn endpoints_require_a_year_query_param() {
+    async fn endpoints_require_valid_year_and_month_query_params() {
         let (dir, db) = temp_db();
         spend_core::db::ingest_connection(&db).unwrap();
         let app = app(AppState { db_path: db });
         for uri in [
             "/api/summary",
             "/api/series/monthly",
+            "/api/series/cumulative",
+            "/api/series/daily",
+            "/api/series/daily?year=2025",
+            "/api/series/daily?year=2025&month=13",
+            "/api/series/daily?year=2025&month=0",
             "/api/categories",
+            "/api/summary?year=2025&month=13",
             "/api/summary?year=abcd",
+            "/api/summary?year=2025&month=abcd",
+            "/api/series/cumulative?year=2025&month=abc",
         ] {
             let response = app
                 .clone()

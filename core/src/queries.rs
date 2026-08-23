@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use chrono::Datelike;
 use duckdb::Connection;
 use serde::Serialize;
 
@@ -35,6 +36,7 @@ pub struct Meta {
 #[derive(Debug, Clone, Serialize)]
 pub struct Summary {
     pub year: i32,
+    pub month: Option<u32>,
     pub income: f64,
     pub spend: f64,
     pub moved: f64,
@@ -44,6 +46,24 @@ pub struct Summary {
 #[derive(Debug, Clone, Serialize)]
 pub struct MonthlySpend {
     pub month: u32,
+    pub spend: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct YearlySpend {
+    pub year: i32,
+    pub spend: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CumulativePoint {
+    pub month: u32,
+    pub cumulative: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DailySpend {
+    pub day: u32,
     pub spend: f64,
 }
 
@@ -59,17 +79,17 @@ fn cents(value: f64) -> f64 {
     (value * 100.0).round() / 100.0
 }
 
-/// Income, spend (excl. transfer_out), moved-between-accounts, and net for a year.
-/// Amounts are returned as positive magnitudes in CHF.
-pub fn summary(conn: &Connection, year: i32) -> anyhow::Result<Summary> {
+/// Income, spend (excl. transfer_out), moved-between-accounts, and net for a
+/// year or a single month of it. Amounts are returned as positive magnitudes in CHF.
+pub fn summary(conn: &Connection, year: i32, month: Option<u32>) -> anyhow::Result<Summary> {
     let (income, spend, moved): (f64, f64, f64) = conn.query_row(
         "SELECT
                 COALESCE(sum(amount_chf) FILTER (kind = 'income'), 0),
                 COALESCE(sum(-amount_chf) FILTER (kind = 'spend'), 0),
                 COALESCE(sum(-amount_chf) FILTER (kind = 'transfer_out'), 0)
              FROM transactions
-             WHERE year(dt) = ?",
-        duckdb::params![year],
+             WHERE year(dt) = ? AND (? IS NULL OR month(dt) = ?)",
+        duckdb::params![year, month, month],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
     let income = cents(income);
@@ -77,11 +97,88 @@ pub fn summary(conn: &Connection, year: i32) -> anyhow::Result<Summary> {
     let moved = cents(moved);
     Ok(Summary {
         year,
+        month,
         income,
         spend,
         moved,
         net: cents(income - spend),
     })
+}
+
+/// Total spend per year for every year that has transactions, oldest first.
+pub fn yearly_spend(conn: &Connection) -> anyhow::Result<Vec<YearlySpend>> {
+    let mut stmt = conn.prepare(
+        "SELECT year(dt),
+                COALESCE(sum(-amount_chf) FILTER (kind = 'spend'), 0)
+         FROM transactions
+         GROUP BY 1
+         ORDER BY 1",
+    )?;
+    let rows: Vec<(i32, f64)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<duckdb::Result<Vec<_>>>()?;
+    Ok(rows
+        .into_iter()
+        .map(|(year, spend)| YearlySpend {
+            year,
+            spend: cents(spend),
+        })
+        .collect())
+}
+
+/// Running spend within a year; all 12 months are always present.
+pub fn cumulative_spend(conn: &Connection, year: i32) -> anyhow::Result<Vec<CumulativePoint>> {
+    let mut stmt = conn.prepare(
+        "SELECT month(dt), sum(-amount_chf)
+         FROM transactions
+         WHERE year(dt) = ? AND kind = 'spend'
+         GROUP BY 1",
+    )?;
+    let by_month: HashMap<u32, f64> = stmt
+        .query_map([year], |row| {
+            let month: i32 = row.get(0)?;
+            let spend: f64 = row.get(1)?;
+            Ok((month as u32, spend))
+        })?
+        .collect::<duckdb::Result<HashMap<_, _>>>()?;
+
+    let mut running = 0.0;
+    Ok((1..=12)
+        .map(|month| {
+            running += by_month.get(&month).copied().unwrap_or(0.0);
+            CumulativePoint {
+                month,
+                cumulative: cents(running),
+            }
+        })
+        .collect())
+}
+
+/// Spend per day for a month; every day of the month is always present.
+pub fn daily_spend(conn: &Connection, year: i32, month: u32) -> anyhow::Result<Vec<DailySpend>> {
+    let days_in_month = chrono::NaiveDate::from_ymd_opt(year, month, 1)
+        .ok_or_else(|| anyhow::anyhow!("invalid month {month} in {year}"))?
+        .num_days_in_month() as u32;
+    let mut stmt = conn.prepare(
+        "SELECT day(dt), sum(-amount_chf)
+         FROM transactions
+         WHERE year(dt) = ? AND month(dt) = ? AND kind = 'spend'
+         GROUP BY 1",
+    )?;
+    let by_day: HashMap<u32, f64> = stmt
+        .query_map(duckdb::params![year, month], |row| {
+            let day: i32 = row.get(0)?;
+            let spend: f64 = row.get(1)?;
+            Ok((day as u32, spend))
+        })?
+        .collect::<duckdb::Result<HashMap<_, _>>>()?;
+
+    Ok((1..=days_in_month)
+        .map(|day| DailySpend {
+            day,
+            spend: cents(by_day.get(&day).copied().unwrap_or(0.0)),
+        })
+        .collect())
 }
 
 /// Spend per month for a year; all 12 months are always present.
@@ -108,20 +205,26 @@ pub fn monthly_spend(conn: &Connection, year: i32) -> anyhow::Result<Vec<Monthly
         .collect())
 }
 
-/// Spend broken down by category for a year, largest first.
-pub fn category_breakdown(conn: &Connection, year: i32) -> anyhow::Result<Vec<CategorySlice>> {
+/// Spend broken down by category for a year or a single month of it, largest first.
+pub fn category_breakdown(
+    conn: &Connection,
+    year: i32,
+    month: Option<u32>,
+) -> anyhow::Result<Vec<CategorySlice>> {
     let mut stmt = conn.prepare(
         "SELECT COALESCE(c.name, 'uncategorized') AS name,
                 COALESCE(c.color, '#78716c') AS color,
                 sum(-t.amount_chf) AS total
          FROM transactions t
          LEFT JOIN categories c ON c.id = t.category_id
-         WHERE t.kind = 'spend' AND year(t.dt) = ?
+         WHERE t.kind = 'spend' AND year(t.dt) = ? AND (? IS NULL OR month(t.dt) = ?)
          GROUP BY 1, 2
          ORDER BY 3 DESC",
     )?;
     let rows: Vec<(String, String, f64)> = stmt
-        .query_map([year], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .query_map(duckdb::params![year, month, month], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
         .collect::<duckdb::Result<Vec<_>>>()?;
     let total: f64 = rows.iter().map(|(_, _, v)| *v).sum();
     Ok(rows
@@ -244,14 +347,40 @@ mod tests {
     fn summary_aggregates_year_and_excludes_other_years() {
         let conn = seeded();
         insert_sample(&conn);
-        let got = summary(&conn, 2025).unwrap();
+        let got = summary(&conn, 2025, None).unwrap();
         assert_eq!(got.year, 2025);
+        assert_eq!(got.month, None);
         assert_eq!(got.income, 3000.0);
         assert_eq!(got.spend, 425.75);
         assert_eq!(got.moved, 50.0);
         assert_eq!(got.net, 2574.25);
 
-        let empty = summary(&conn, 2023).unwrap();
+        let empty = summary(&conn, 2023, None).unwrap();
+        assert_eq!(empty.income, 0.0);
+        assert_eq!(empty.spend, 0.0);
+        assert_eq!(empty.moved, 0.0);
+        assert_eq!(empty.net, 0.0);
+    }
+
+    #[test]
+    fn summary_scoped_to_a_single_month() {
+        let conn = seeded();
+        insert_sample(&conn);
+        let jan = summary(&conn, 2025, Some(1)).unwrap();
+        assert_eq!(jan.year, 2025);
+        assert_eq!(jan.month, Some(1));
+        assert_eq!(jan.income, 1000.0);
+        assert_eq!(jan.spend, 100.0);
+        assert_eq!(jan.moved, 50.0);
+        assert_eq!(jan.net, 900.0);
+
+        let dec = summary(&conn, 2025, Some(12)).unwrap();
+        assert_eq!(dec.income, 0.0);
+        assert_eq!(dec.spend, 75.25);
+        assert_eq!(dec.moved, 0.0);
+        assert_eq!(dec.net, -75.25);
+
+        let empty = summary(&conn, 2025, Some(3)).unwrap();
         assert_eq!(empty.income, 0.0);
         assert_eq!(empty.spend, 0.0);
         assert_eq!(empty.moved, 0.0);
@@ -285,7 +414,7 @@ mod tests {
     fn category_breakdown_orders_by_value_and_computes_percentages() {
         let conn = seeded();
         insert_sample(&conn);
-        let slices = category_breakdown(&conn, 2025).unwrap();
+        let slices = category_breakdown(&conn, 2025, None).unwrap();
         assert_eq!(
             slices
                 .iter()
@@ -296,6 +425,93 @@ mod tests {
         assert_eq!(slices[0].color, "#8b5cf6");
         assert_eq!(slices[1].color, "#ef4444");
 
-        assert!(category_breakdown(&conn, 2023).unwrap().is_empty());
+        assert!(category_breakdown(&conn, 2023, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn category_breakdown_scoped_to_a_single_month() {
+        let conn = seeded();
+        insert_sample(&conn);
+        let feb = category_breakdown(&conn, 2025, Some(2)).unwrap();
+        assert_eq!(
+            feb.iter()
+                .map(|s| (s.name.as_str(), s.value, s.percentage))
+                .collect::<Vec<_>>(),
+            vec![("travel", 250.5, 100.0),]
+        );
+        assert!(category_breakdown(&conn, 2025, Some(3)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn yearly_spend_covers_every_year_with_data_oldest_first() {
+        let conn = seeded();
+        insert_sample(&conn);
+        let got = yearly_spend(&conn).unwrap();
+        assert_eq!(
+            got.iter().map(|p| (p.year, p.spend)).collect::<Vec<_>>(),
+            vec![(2024, 999.0), (2025, 425.75)]
+        );
+
+        let empty = yearly_spend(&seeded()).unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn cumulative_spend_runs_up_within_the_year() {
+        let conn = seeded();
+        insert_sample(&conn);
+        let got = cumulative_spend(&conn, 2025).unwrap();
+        assert_eq!(got.len(), 12);
+        assert_eq!(
+            got.iter()
+                .map(|p| (p.month, p.cumulative))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, 100.0),
+                (2, 350.5),
+                (3, 350.5),
+                (4, 350.5),
+                (5, 350.5),
+                (6, 350.5),
+                (7, 350.5),
+                (8, 350.5),
+                (9, 350.5),
+                (10, 350.5),
+                (11, 350.5),
+                (12, 425.75)
+            ]
+        );
+
+        let empty = cumulative_spend(&conn, 2023).unwrap();
+        assert_eq!(empty.len(), 12);
+        assert!(empty.iter().all(|p| p.cumulative == 0.0));
+    }
+
+    #[test]
+    fn daily_spend_covers_every_day_of_the_month() {
+        let conn = seeded();
+        insert_sample(&conn);
+        let jan = daily_spend(&conn, 2025, 1).unwrap();
+        assert_eq!(jan.len(), 31);
+        assert_eq!(
+            jan.iter()
+                .filter(|p| p.spend > 0.0)
+                .map(|p| (p.day, p.spend))
+                .collect::<Vec<_>>(),
+            vec![(5, 100.0)]
+        );
+        assert_eq!(jan[11].spend, 0.0);
+
+        let feb = daily_spend(&conn, 2025, 2).unwrap();
+        assert_eq!(feb.len(), 28);
+        assert_eq!(feb[13].spend, 250.5);
+
+        // Leap-year February has 29 days; the 2024 spend lands on day 15.
+        let feb_2024 = daily_spend(&conn, 2024, 2).unwrap();
+        assert_eq!(feb_2024.len(), 29);
+        assert!(feb_2024.iter().all(|p| p.spend == 0.0));
+        let jun_2024 = daily_spend(&conn, 2024, 6).unwrap();
+        assert_eq!(jun_2024.len(), 30);
+        assert_eq!(jun_2024[14].spend, 999.0);
     }
 }

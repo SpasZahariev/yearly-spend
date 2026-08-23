@@ -1,9 +1,11 @@
-import { useEffect, useState } from "react"
+import { useEffect, useState, type ReactNode } from "react"
 import {
   Bar,
   BarChart,
   CartesianGrid,
   Cell,
+  Line,
+  LineChart,
   Pie,
   PieChart,
   ResponsiveContainer,
@@ -14,6 +16,7 @@ import {
 
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { cn } from "@/lib/utils"
 
 interface Account {
   id: number
@@ -42,6 +45,7 @@ interface Meta {
 
 interface Summary {
   year: number
+  month: number | null
   income: number
   spend: number
   moved: number
@@ -53,6 +57,21 @@ interface MonthlyPoint {
   spend: number
 }
 
+interface YearlyPoint {
+  year: number
+  spend: number
+}
+
+interface CumulativePoint {
+  month: number
+  cumulative: number
+}
+
+interface DailyPoint {
+  day: number
+  spend: number
+}
+
 interface CategorySlice {
   name: string
   color: string
@@ -60,11 +79,25 @@ interface CategorySlice {
   percentage: number
 }
 
-interface Dashboard {
-  summary: Summary
-  months: MonthlyPoint[]
-  slices: CategorySlice[]
+interface YearData {
+  yearly: YearlyPoint[]
+  cumulative: CumulativePoint[]
 }
+
+interface MonthData {
+  months: MonthlyPoint[]
+  days: DailyPoint[]
+}
+
+interface DashboardData {
+  summary: Summary
+  slices: CategorySlice[]
+  yearData: YearData | null
+  monthData: MonthData | null
+}
+
+type View = "month" | "year"
+type Granularity = "month" | "day"
 
 const MONTH_LABELS = [
   "Jan",
@@ -95,6 +128,10 @@ function formatChf(value: number) {
   return chf.format(value)
 }
 
+function periodLabel(view: View, year: number, month: number) {
+  return view === "month" ? `${MONTH_LABELS[month - 1]} ${year}` : String(year)
+}
+
 async function getJson<T>(url: string): Promise<T> {
   const res = await fetch(url)
   if (!res.ok) {
@@ -103,7 +140,62 @@ async function getJson<T>(url: string): Promise<T> {
   return (await res.json()) as T
 }
 
-function KpiCard({ label, value, year }: { label: string; value: number; year: number }) {
+function fetchYearData(year: number): Promise<YearData> {
+  return Promise.all([
+    getJson<YearlyPoint[]>("/api/series/yearly"),
+    getJson<CumulativePoint[]>(`/api/series/cumulative?year=${year}`),
+  ]).then(([yearly, cumulative]) => ({ yearly, cumulative }))
+}
+
+function fetchMonthData(year: number, month: number, granularity: Granularity): Promise<MonthData> {
+  if (granularity === "month") {
+    return getJson<MonthlyPoint[]>(`/api/series/monthly?year=${year}`).then((months) => ({
+      months,
+      days: [],
+    }))
+  }
+  return getJson<DailyPoint[]>(`/api/series/daily?year=${year}&month=${month}`).then((days) => ({
+    months: [],
+    days,
+  }))
+}
+
+function Segmented<T extends string>({
+  options,
+  value,
+  onChange,
+  compact = false,
+}: {
+  options: readonly { readonly value: T; readonly label: string }[]
+  value: T
+  onChange: (value: T) => void
+  compact?: boolean
+}) {
+  return (
+    <div className="inline-flex overflow-hidden rounded-none border-2 border-input">
+      {options.map((option, index) => (
+        <button
+          key={option.value}
+          type="button"
+          onClick={() => onChange(option.value)}
+          aria-pressed={value === option.value}
+          className={cn(
+            "font-mono uppercase tracking-widest focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+            compact ? "h-8 px-2.5 text-[11px]" : "h-9 px-3 text-xs",
+            index > 0 && "border-l-2 border-input",
+            value === option.value
+              ? "bg-primary text-primary-foreground"
+              : "bg-background text-foreground hover:bg-accent hover:text-accent-foreground",
+          )}
+        >
+          {option.label}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+function KpiCard({ label, value, period }: { label: string; value: number; period: string }) {
   return (
     <Card className="animate-step-in">
       <CardContent className="p-6">
@@ -111,7 +203,7 @@ function KpiCard({ label, value, year }: { label: string; value: number; year: n
           {label}
         </div>
         <div className="mt-2 font-pixel text-3xl leading-none">{formatChf(value)}</div>
-        <div className="mt-2 font-mono text-xs text-muted-foreground">CHF · {year}</div>
+        <div className="mt-2 font-mono text-xs text-muted-foreground">CHF · {period}</div>
       </CardContent>
     </Card>
   )
@@ -126,9 +218,113 @@ const tooltipStyle = {
   boxShadow: "4px 4px 0 var(--border)",
 }
 
-function MonthlySpendChart({ year, months }: { year: number; months: MonthlyPoint[] }) {
+const axisTick = { fontSize: 11, fontFamily: "Inter, sans-serif" }
+
+function ChartLabel({ children }: { children: ReactNode }) {
+  return (
+    <div className="mb-1 font-mono text-[11px] uppercase tracking-widest text-muted-foreground">
+      {children}
+    </div>
+  )
+}
+
+function YearlySpendChart({ year, points }: { year: number; points: YearlyPoint[] }) {
+  const data = points.map((point) => ({
+    label: String(point.year),
+    year: point.year,
+    spend: point.spend,
+  }))
+  return (
+    <ResponsiveContainer width="100%" height={192}>
+      <BarChart data={data} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+        <CartesianGrid vertical={false} stroke="var(--muted)" />
+        <XAxis
+          dataKey="label"
+          interval={0}
+          tickLine={false}
+          axisLine={{ stroke: "var(--border)", strokeWidth: 2 }}
+          tick={axisTick}
+        />
+        <YAxis
+          tickLine={false}
+          axisLine={false}
+          width={44}
+          tickFormatter={(value: number) => chfCompact.format(value)}
+          tick={axisTick}
+        />
+        <Tooltip
+          cursor={{ fill: "var(--muted)" }}
+          contentStyle={tooltipStyle}
+          formatter={(value) => [formatChf(Number(value)), "spend"]}
+        />
+        <Bar dataKey="spend" stroke="var(--border)" strokeWidth={2} isAnimationActive={false}>
+          {data.map((point) => (
+            <Cell
+              key={point.year}
+              fill={point.year === year ? "var(--foreground)" : "var(--chart-4)"}
+            />
+          ))}
+        </Bar>
+      </BarChart>
+    </ResponsiveContainer>
+  )
+}
+
+function CumulativeChart({ year, points }: { year: number; points: CumulativePoint[] }) {
+  const data = points.map((point) => ({
+    label: MONTH_LABELS[point.month - 1],
+    cumulative: point.cumulative,
+  }))
+  return (
+    <ResponsiveContainer width="100%" height={176}>
+      <LineChart data={data} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+        <CartesianGrid vertical={false} stroke="var(--muted)" />
+        <XAxis
+          dataKey="label"
+          interval={0}
+          tickLine={false}
+          axisLine={{ stroke: "var(--border)", strokeWidth: 2 }}
+          tick={axisTick}
+        />
+        <YAxis
+          tickLine={false}
+          axisLine={false}
+          width={44}
+          tickFormatter={(value: number) => chfCompact.format(value)}
+          tick={axisTick}
+        />
+        <Tooltip
+          cursor={{ stroke: "var(--border)" }}
+          contentStyle={tooltipStyle}
+          formatter={(value) => [formatChf(Number(value)), "cumulative"]}
+          labelFormatter={(label) => `${label} ${year}`}
+        />
+        <Line
+          dataKey="cumulative"
+          type="stepAfter"
+          stroke="var(--foreground)"
+          strokeWidth={2}
+          dot={{ r: 2.5, fill: "var(--foreground)", strokeWidth: 0 }}
+          activeDot={{ r: 4, fill: "var(--foreground)", strokeWidth: 0 }}
+          isAnimationActive={false}
+        />
+      </LineChart>
+    </ResponsiveContainer>
+  )
+}
+
+function MonthlySpendChart({
+  year,
+  months,
+  selectedMonth,
+}: {
+  year: number
+  months: MonthlyPoint[]
+  selectedMonth: number
+}) {
   const data = months.map((point) => ({
     label: MONTH_LABELS[point.month - 1],
+    month: point.month,
     spend: point.spend,
   }))
   return (
@@ -140,14 +336,14 @@ function MonthlySpendChart({ year, months }: { year: number; months: MonthlyPoin
           interval={0}
           tickLine={false}
           axisLine={{ stroke: "var(--border)", strokeWidth: 2 }}
-          tick={{ fontSize: 11, fontFamily: "Inter, sans-serif" }}
+          tick={axisTick}
         />
         <YAxis
           tickLine={false}
           axisLine={false}
           width={44}
           tickFormatter={(value: number) => chfCompact.format(value)}
-          tick={{ fontSize: 11, fontFamily: "Inter, sans-serif" }}
+          tick={axisTick}
         />
         <Tooltip
           cursor={{ fill: "var(--muted)" }}
@@ -155,11 +351,61 @@ function MonthlySpendChart({ year, months }: { year: number; months: MonthlyPoin
           formatter={(value) => [formatChf(Number(value)), "spend"]}
           labelFormatter={(label) => `${label} ${year}`}
         />
+        <Bar dataKey="spend" stroke="var(--border)" strokeWidth={2} isAnimationActive={false}>
+          {data.map((point) => (
+            <Cell
+              key={point.month}
+              fill={point.month === selectedMonth ? "var(--foreground)" : "var(--chart-4)"}
+            />
+          ))}
+        </Bar>
+      </BarChart>
+    </ResponsiveContainer>
+  )
+}
+
+function DailySpendChart({
+  year,
+  month,
+  days,
+}: {
+  year: number
+  month: number
+  days: DailyPoint[]
+}) {
+  const data = days.map((point) => ({
+    label: String(point.day),
+    spend: point.spend,
+  }))
+  return (
+    <ResponsiveContainer width="100%" height={288}>
+      <BarChart data={data} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+        <CartesianGrid vertical={false} stroke="var(--muted)" />
+        <XAxis
+          dataKey="label"
+          interval={0}
+          tickLine={false}
+          axisLine={{ stroke: "var(--border)", strokeWidth: 2 }}
+          tick={{ fontSize: 9, fontFamily: "Inter, sans-serif" }}
+        />
+        <YAxis
+          tickLine={false}
+          axisLine={false}
+          width={44}
+          tickFormatter={(value: number) => chfCompact.format(value)}
+          tick={axisTick}
+        />
+        <Tooltip
+          cursor={{ fill: "var(--muted)" }}
+          contentStyle={tooltipStyle}
+          formatter={(value) => [formatChf(Number(value)), "spend"]}
+          labelFormatter={(label) => `${MONTH_LABELS[month - 1]} ${label} ${year}`}
+        />
         <Bar
           dataKey="spend"
           fill="var(--foreground)"
           stroke="var(--border)"
-          strokeWidth={2}
+          strokeWidth={1}
           isAnimationActive={false}
         />
       </BarChart>
@@ -245,10 +491,19 @@ function EmptyState() {
   )
 }
 
+function defaultMonthFor(year: number, periods: Period[]) {
+  const months = periods.filter((period) => period.year === year).map((period) => period.month)
+  return months.length > 0 ? Math.max(...months) : 12
+}
+
 export default function App() {
+  const [view, setView] = useState<View>("year")
+  const [granularity, setGranularity] = useState<Granularity>("month")
+  const [periods, setPeriods] = useState<Period[]>([])
   const [years, setYears] = useState<number[]>([])
   const [year, setYear] = useState<number | null>(null)
-  const [dashboard, setDashboard] = useState<Dashboard | null>(null)
+  const [month, setMonth] = useState<number | null>(null)
+  const [data, setData] = useState<DashboardData | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
@@ -256,11 +511,16 @@ export default function App() {
     getJson<Meta>("/api/meta")
       .then((meta) => {
         if (cancelled) return
+        setPeriods(meta.periods)
         const available = [...new Set(meta.periods.map((period) => period.year))].sort(
           (a, b) => a - b,
         )
         setYears(available)
-        setYear(available.length > 0 ? available[available.length - 1] : null)
+        if (available.length > 0) {
+          const latest = available[available.length - 1]
+          setYear(latest)
+          setMonth(defaultMonthFor(latest, meta.periods))
+        }
       })
       .catch((err: unknown) => {
         if (!cancelled) setError(err instanceof Error ? err.message : String(err))
@@ -271,15 +531,24 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    if (year === null) return
+    if (year === null || month === null) return
     let cancelled = false
+    const period = (path: string) =>
+      view === "month" ? `${path}?year=${year}&month=${month}` : `${path}?year=${year}`
     Promise.all([
-      getJson<Summary>(`/api/summary?year=${year}`),
-      getJson<MonthlyPoint[]>(`/api/series/monthly?year=${year}`),
-      getJson<CategorySlice[]>(`/api/categories?year=${year}`),
+      getJson<Summary>(period("/api/summary")),
+      getJson<CategorySlice[]>(period("/api/categories")),
+      view === "year" ? fetchYearData(year) : fetchMonthData(year, month, granularity),
     ])
-      .then(([summary, months, slices]) => {
-        if (!cancelled) setDashboard({ summary, months, slices })
+      .then(([summary, slices, extra]) => {
+        if (cancelled) return
+        setData({
+          summary,
+          slices,
+          yearData: view === "year" ? (extra as YearData) : null,
+          monthData: view === "month" ? (extra as MonthData) : null,
+        })
+        setError(null)
       })
       .catch((err: unknown) => {
         if (!cancelled) setError(err instanceof Error ? err.message : String(err))
@@ -287,33 +556,71 @@ export default function App() {
     return () => {
       cancelled = true
     }
-  }, [year])
+  }, [year, month, view, granularity])
 
+  function selectYear(next: number) {
+    setYear(next)
+    setMonth(defaultMonthFor(next, periods))
+  }
+
+  const expectedMonth = view === "month" ? month : null
   const current =
-    dashboard !== null && year !== null && dashboard.summary.year === year ? dashboard : null
-  const chartMonths = current?.months ?? []
+    data !== null &&
+    year !== null &&
+    data.summary.year === year &&
+    data.summary.month === expectedMonth
+      ? data
+      : null
+  const loading = year !== null && month !== null && error === null && current === null
+  const label = year !== null && month !== null ? periodLabel(view, year, month) : "…"
+  const summary = current?.summary ?? null
   const slices = current?.slices ?? []
-  const loading = year !== null && error === null && current === null
+  const yearData = current?.yearData ?? null
+  const monthData = current?.monthData ?? null
 
   return (
     <div className="flex min-h-dvh flex-col bg-background text-foreground">
       <header className="pixel-rows border-b-2 border-border px-6 py-4">
-        <div className="mx-auto flex w-full max-w-5xl items-center justify-between gap-4">
+        <div className="mx-auto flex w-full max-w-5xl flex-wrap items-center justify-between gap-4">
           <h1 className="font-pixel text-2xl tracking-tight">
             yearly-spend<span className="animate-step-blink">_</span>
           </h1>
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-3">
+            <Segmented
+              options={[
+                { value: "month", label: "month" },
+                { value: "year", label: "year" },
+              ]}
+              value={view}
+              onChange={setView}
+            />
             {years.length > 0 && (
               <label className="flex items-center gap-2 font-mono text-xs uppercase tracking-widest text-muted-foreground">
                 year
                 <select
                   value={year ?? ""}
-                  onChange={(event) => setYear(Number(event.target.value))}
+                  onChange={(event) => selectYear(Number(event.target.value))}
                   className="h-9 rounded-none border-2 border-input bg-background px-2 font-mono text-sm text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 >
                   {years.map((option) => (
                     <option key={option} value={option}>
                       {option}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
+            {view === "month" && years.length > 0 && (
+              <label className="flex items-center gap-2 font-mono text-xs uppercase tracking-widest text-muted-foreground">
+                month
+                <select
+                  value={month ?? ""}
+                  onChange={(event) => setMonth(Number(event.target.value))}
+                  className="h-9 rounded-none border-2 border-input bg-background px-2 font-mono text-sm text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  {MONTH_LABELS.map((name, index) => (
+                    <option key={name} value={index + 1}>
+                      {name}
                     </option>
                   ))}
                 </select>
@@ -337,37 +644,85 @@ export default function App() {
       ) : (
         <main className="flex-1 px-6 py-8">
           <div className="mx-auto flex w-full max-w-5xl flex-col gap-6">
-            {year !== null && (
+            {year !== null && month !== null && (
               <div className="grid grid-cols-1 gap-6 sm:grid-cols-2">
-                <KpiCard label="income" value={current?.summary.income ?? 0} year={year} />
-                <KpiCard label="spend" value={current?.summary.spend ?? 0} year={year} />
+                <KpiCard label="income" value={summary?.income ?? 0} period={label} />
+                <KpiCard label="spend" value={summary?.spend ?? 0} period={label} />
               </div>
             )}
 
             <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-              <Card className="animate-step-in">
-                <CardHeader>
-                  <CardTitle className="text-lg">monthly spend</CardTitle>
-                  <CardDescription>CHF · {year ?? "…"}</CardDescription>
-                </CardHeader>
-                <CardContent>
-                  {loading || year === null ? (
-                    <div className="flex h-72 items-center justify-center font-mono text-sm text-muted-foreground">
-                      loading…
+              {view === "year" ? (
+                <Card className="animate-step-in">
+                  <CardHeader>
+                    <CardTitle className="text-lg">yearly spend</CardTitle>
+                    <CardDescription>
+                      CHF · totals per year + cumulative {year ?? "…"}
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent className="flex flex-col gap-5">
+                    {loading || year === null || yearData === null ? (
+                      <div className="flex h-72 items-center justify-center font-mono text-sm text-muted-foreground">
+                        loading…
+                      </div>
+                    ) : (
+                      <>
+                        <div>
+                          <ChartLabel>total per year</ChartLabel>
+                          <YearlySpendChart year={year} points={yearData.yearly} />
+                        </div>
+                        <div>
+                          <ChartLabel>cumulative spend · {year}</ChartLabel>
+                          <CumulativeChart year={year} points={yearData.cumulative} />
+                        </div>
+                      </>
+                    )}
+                  </CardContent>
+                </Card>
+              ) : (
+                <Card className="animate-step-in">
+                  <CardHeader className="flex-row items-start justify-between gap-4">
+                    <div className="flex flex-col gap-1.5">
+                      <CardTitle className="text-lg">
+                        {granularity === "day" ? "daily spend" : "monthly spend"}
+                      </CardTitle>
+                      <CardDescription>CHF · {label}</CardDescription>
                     </div>
-                  ) : (
-                    <MonthlySpendChart year={year} months={chartMonths} />
-                  )}
-                </CardContent>
-              </Card>
+                    <Segmented
+                      compact
+                      options={[
+                        { value: "month", label: "month" },
+                        { value: "day", label: "day" },
+                      ]}
+                      value={granularity}
+                      onChange={setGranularity}
+                    />
+                  </CardHeader>
+                  <CardContent>
+                    {loading || year === null || month === null || monthData === null ? (
+                      <div className="flex h-72 items-center justify-center font-mono text-sm text-muted-foreground">
+                        loading…
+                      </div>
+                    ) : granularity === "month" ? (
+                      <MonthlySpendChart
+                        year={year}
+                        months={monthData.months}
+                        selectedMonth={month}
+                      />
+                    ) : (
+                      <DailySpendChart year={year} month={month} days={monthData.days} />
+                    )}
+                  </CardContent>
+                </Card>
+              )}
 
               <Card className="animate-step-in">
                 <CardHeader>
                   <CardTitle className="text-lg">categories</CardTitle>
-                  <CardDescription>spend by category · {year ?? "…"}</CardDescription>
+                  <CardDescription>spend by category · {label}</CardDescription>
                 </CardHeader>
                 <CardContent>
-                  {loading || year === null ? (
+                  {loading || summary === null ? (
                     <div className="flex h-72 items-center justify-center font-mono text-sm text-muted-foreground">
                       loading…
                     </div>
