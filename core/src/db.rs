@@ -11,6 +11,19 @@ pub fn ingest_connection(path: &Path) -> anyhow::Result<Connection> {
     Ok(conn)
 }
 
+/// The API opens a short-lived read-write connection to persist inline
+/// overrides (category / transfer flag edits from the dashboard). The file
+/// lock is released as soon as the connection drops, so `spend ingest` can
+/// still open the database while the API is idle. The schema is ensured
+/// idempotently so a PATCH against a fresh checkout cannot fail on missing
+/// tables.
+pub fn api_write_connection(path: &Path) -> anyhow::Result<Connection> {
+    create_parent(path)?;
+    let conn = Connection::open(path)?;
+    schema::migrate(&conn)?;
+    Ok(conn)
+}
+
 /// The API process only needs read-only access, but a fresh checkout has no
 /// database file yet, so it bootstraps the schema once when missing.
 pub fn api_connection(path: &Path) -> anyhow::Result<Connection> {

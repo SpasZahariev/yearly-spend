@@ -14,9 +14,12 @@ import {
   YAxis,
 } from "recharts"
 
+import { TransactionsTable } from "@/components/TransactionsTable"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { getJson } from "@/lib/api"
 import { cn } from "@/lib/utils"
+import type { Category } from "@/types"
 
 interface Account {
   id: number
@@ -24,12 +27,6 @@ interface Account {
   name: string
   currency: string | null
   is_internal: boolean
-}
-
-interface Category {
-  id: number
-  name: string
-  color: string
 }
 
 interface Period {
@@ -149,14 +146,6 @@ const compactNumber = new Intl.NumberFormat("de-CH", {
 
 function periodLabel(view: View, year: number, month: number) {
   return view === "month" ? `${MONTH_LABELS[month - 1]} ${year}` : String(year)
-}
-
-async function getJson<T>(url: string): Promise<T> {
-  const res = await fetch(url)
-  if (!res.ok) {
-    throw new Error(`${url} responded ${res.status}`)
-  }
-  return (await res.json()) as T
 }
 
 function fetchYearData(year: number): Promise<YearData> {
@@ -572,6 +561,8 @@ export default function App() {
   const [month, setMonth] = useState<number | null>(null)
   const [data, setData] = useState<DashboardData | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [taxonomy, setTaxonomy] = useState<Category[]>([])
+  const [overrideKey, setOverrideKey] = useState(0)
   const [currency, setCurrency] = useState<Currency>("CHF")
   const [fx, setFx] = useState<Partial<Record<Currency, FxState>>>({})
   const fxRequests = useRef(new Map<Currency, Promise<void>>())
@@ -609,6 +600,7 @@ export default function App() {
       .then((meta) => {
         if (cancelled) return
         setPeriods(meta.periods)
+        setTaxonomy(meta.categories)
         const available = [...new Set(meta.periods.map((period) => period.year))].sort(
           (a, b) => a - b,
         )
@@ -653,7 +645,7 @@ export default function App() {
     return () => {
       cancelled = true
     }
-  }, [year, month, view, granularity])
+  }, [year, month, view, granularity, overrideKey])
 
   function selectYear(next: number) {
     setYear(next)
@@ -707,6 +699,7 @@ export default function App() {
               <label className="flex items-center gap-2 font-mono text-xs uppercase tracking-widest text-muted-foreground">
                 year
                 <select
+                  name="year"
                   value={year ?? ""}
                   onChange={(event) => selectYear(Number(event.target.value))}
                   className="h-9 rounded-none border-2 border-input bg-background px-2 font-mono text-sm text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
@@ -723,6 +716,7 @@ export default function App() {
               <label className="flex items-center gap-2 font-mono text-xs uppercase tracking-widest text-muted-foreground">
                 month
                 <select
+                  name="month"
                   value={month ?? ""}
                   onChange={(event) => setMonth(Number(event.target.value))}
                   className="h-9 rounded-none border-2 border-input bg-background px-2 font-mono text-sm text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
@@ -880,6 +874,16 @@ export default function App() {
                 </CardContent>
               </Card>
             </div>
+
+            {current !== null && fxReady && year !== null && (
+              <TransactionsTable
+                key={year}
+                year={year}
+                categories={taxonomy}
+                format={format}
+                onOverride={() => setOverrideKey((key) => key + 1)}
+              />
+            )}
           </div>
         </main>
       )}

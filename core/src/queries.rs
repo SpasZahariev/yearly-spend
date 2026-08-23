@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use chrono::Datelike;
+use chrono::{Datelike, NaiveDate};
 use duckdb::Connection;
 use serde::Serialize;
 
@@ -248,6 +248,177 @@ pub fn category_breakdown(
             }
         })
         .collect())
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Transaction {
+    pub id: i64,
+    pub dt: String,
+    pub description: String,
+    pub subject: Option<String>,
+    pub source: String,
+    pub account: String,
+    pub amount_chf: f64,
+    pub currency_orig: String,
+    pub amount_orig: f64,
+    pub kind: String,
+    pub is_transfer: bool,
+    pub category: Option<Category>,
+}
+
+/// Optional filters for the transaction list. `None` fields are unconstrained;
+/// a `category` of `"uncategorized"` matches rows with no category.
+#[derive(Debug, Clone, Default)]
+pub struct TransactionFilters {
+    pub year: Option<i32>,
+    pub month: Option<u32>,
+    pub source: Option<String>,
+    pub category: Option<String>,
+}
+
+/// The `WHERE` clause (positional `?` placeholders) plus the matching bound
+/// values, in order.
+fn transaction_where_params(filters: &TransactionFilters) -> (String, Vec<Box<dyn duckdb::ToSql>>) {
+    let mut where_clause = String::from(" WHERE 1 = 1");
+    let mut params: Vec<Box<dyn duckdb::ToSql>> = Vec::new();
+    if let Some(year) = filters.year {
+        where_clause.push_str(" AND year(t.dt) = ?");
+        params.push(Box::new(year));
+    }
+    if let Some(month) = filters.month {
+        where_clause.push_str(" AND month(t.dt) = ?");
+        params.push(Box::new(month as i32));
+    }
+    if let Some(source) = &filters.source {
+        where_clause.push_str(" AND t.source = ?");
+        params.push(Box::new(source.clone()));
+    }
+    if let Some(category) = &filters.category {
+        where_clause.push_str(" AND (? = 'uncategorized' AND t.category_id IS NULL OR c.name = ?)");
+        params.push(Box::new(category.clone()));
+        params.push(Box::new(category.clone()));
+    }
+    (where_clause, params)
+}
+
+fn row_to_transaction(row: &duckdb::Row<'_>) -> duckdb::Result<Transaction> {
+    let dt: NaiveDate = row.get(1)?;
+    let kind: String = row.get(9)?;
+    Ok(Transaction {
+        id: row.get(0)?,
+        dt: dt.format("%Y-%m-%d").to_string(),
+        description: row.get(2)?,
+        subject: row.get(3)?,
+        source: row.get(4)?,
+        account: row.get(5)?,
+        amount_chf: row.get(6)?,
+        currency_orig: row.get(7)?,
+        amount_orig: row.get(8)?,
+        is_transfer: kind == "transfer_out" || kind == "transfer_in",
+        kind,
+        category: match (
+            row.get::<_, Option<i64>>(10)?,
+            row.get::<_, Option<String>>(11)?,
+            row.get::<_, Option<String>>(12)?,
+        ) {
+            (Some(id), Some(name), Some(color)) => Some(Category { id, name, color }),
+            _ => None,
+        },
+    })
+}
+
+const TRANSACTION_SELECT: &str = "SELECT t.id, t.dt, t.description, t.subject, t.source, a.name, t.amount_chf, t.currency_orig, t.amount_orig, t.kind, c.id, c.name, c.color FROM transactions t JOIN accounts a ON a.id = t.account_id LEFT JOIN categories c ON c.id = t.category_id";
+
+/// One page of transactions, newest first, with the total filtered count.
+/// `page` is 1-based; `page_size` is clamped by the caller.
+pub fn list_transactions(
+    conn: &Connection,
+    filters: &TransactionFilters,
+    page: u32,
+    page_size: u32,
+) -> anyhow::Result<(Vec<Transaction>, i64)> {
+    let (where_clause, mut values) = transaction_where_params(filters);
+    values.push(Box::new(page_size as i32));
+    let offset = (page.saturating_sub(1) as i32) * (page_size as i32);
+    values.push(Box::new(offset));
+    let params: Vec<&dyn duckdb::ToSql> = values.iter().map(|v| v.as_ref()).collect();
+
+    let count_sql = format!(
+        "SELECT count(*) FROM transactions t LEFT JOIN categories c ON c.id = t.category_id{where_clause}"
+    );
+    let total: i64 = conn.query_row(&count_sql, &params[..params.len() - 2], |row| row.get(0))?;
+
+    let list_sql = format!(
+        "{TRANSACTION_SELECT}{where_clause} ORDER BY t.dt DESC, t.id DESC LIMIT ? OFFSET ?"
+    );
+    let mut stmt = conn.prepare(&list_sql)?;
+    let rows = stmt.query_map(params.as_slice(), row_to_transaction)?;
+    let items: Vec<Transaction> = rows.collect::<duckdb::Result<Vec<_>>>()?;
+    Ok((items, total))
+}
+
+/// A single transaction by id, or `None` when it does not exist.
+pub fn get_transaction(conn: &Connection, id: i64) -> anyhow::Result<Option<Transaction>> {
+    let mut stmt = conn.prepare(&format!("{TRANSACTION_SELECT} WHERE t.id = ?"))?;
+    let mut rows = stmt.query_map([id], row_to_transaction)?;
+    Ok(rows.next().transpose()?)
+}
+
+/// The taxonomy id for a category name, or `None` when the name is not in the
+/// fixed taxonomy.
+pub fn category_id_for_name(conn: &Connection, name: &str) -> anyhow::Result<Option<i64>> {
+    let mut stmt = conn.prepare("SELECT id FROM categories WHERE name = ?")?;
+    let mut rows = stmt.query_map([name], |row| row.get(0))?;
+    Ok(rows.next().transpose()?)
+}
+
+/// Apply an inline override. Returns the number of rows updated (0 when the
+/// id does not exist).
+///
+/// `category` is a tri-state: `None` leaves the category untouched,
+/// `Some(None)` clears it to `NULL` (uncategorized), `Some(Some(id))` sets it
+/// to `id`. `new_kind = None` leaves the kind untouched.
+pub fn set_transaction(
+    conn: &Connection,
+    id: i64,
+    category: Option<Option<i64>>,
+    new_kind: Option<&str>,
+) -> anyhow::Result<usize> {
+    let mut sets: Vec<&str> = Vec::new();
+    let mut params: Vec<Box<dyn duckdb::ToSql>> = Vec::new();
+    match category {
+        Some(Some(cid)) => {
+            sets.push("category_id = ?");
+            params.push(Box::new(cid));
+        }
+        Some(None) => sets.push("category_id = NULL"),
+        None => {}
+    }
+    if let Some(kind) = new_kind {
+        sets.push("kind = ?");
+        params.push(Box::new(kind.to_string()));
+    }
+    if sets.is_empty() {
+        return Ok(0);
+    }
+    let sql = format!("UPDATE transactions SET {} WHERE id = ?", sets.join(", "));
+    params.push(Box::new(id));
+    let refs: Vec<&dyn duckdb::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let updated = conn.execute(&sql, refs.as_slice())?;
+    Ok(updated)
+}
+
+/// The `kind` a row takes for a transfer flag, from the sign of its CHF
+/// amount. A negative amount leaving the account is `transfer_out` when
+/// flagged and `spend` when not; a positive (or zero) amount is `transfer_in`
+/// / `income`.
+pub fn kind_for_transfer(amount_chf: f64, is_transfer: bool) -> &'static str {
+    match (is_transfer, amount_chf < 0.0) {
+        (true, true) => "transfer_out",
+        (true, false) => "transfer_in",
+        (false, true) => "spend",
+        (false, false) => "income",
+    }
 }
 
 pub fn meta(conn: &Connection) -> anyhow::Result<Meta> {
@@ -554,5 +725,231 @@ mod tests {
         let jun_2024 = daily_spend(&conn, 2024, 6).unwrap();
         assert_eq!(jun_2024.len(), 30);
         assert_eq!(jun_2024[14].spend, 999.0);
+    }
+
+    /// The id of the sample row whose `source_key` (== its date) is `dt`.
+    fn id_for_key(conn: &Connection, key: &str) -> i64 {
+        conn.query_row(
+            "SELECT id FROM transactions WHERE source_key = ?",
+            [key],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn list_transactions_returns_all_newest_first_with_total() {
+        let conn = seeded();
+        insert_sample(&conn);
+        let (items, total) =
+            list_transactions(&conn, &TransactionFilters::default(), 1, 100).unwrap();
+        assert_eq!(total, 7);
+        assert_eq!(items.len(), 7);
+        // Newest first: the 2025-12-31 row leads, the 2024-06-15 row trails.
+        assert_eq!(items[0].dt, "2025-12-31");
+        assert_eq!(items[6].dt, "2024-06-15");
+        assert_eq!(items[0].category.as_ref().unwrap().name, "food");
+        assert!(!items[0].is_transfer);
+    }
+
+    #[test]
+    fn list_transactions_filters_by_year_source_and_category() {
+        let conn = seeded();
+        insert_sample(&conn);
+
+        let year = TransactionFilters {
+            year: Some(2025),
+            ..Default::default()
+        };
+        let (items, total) = list_transactions(&conn, &year, 1, 100).unwrap();
+        assert_eq!(total, 6);
+        assert!(items.iter().all(|t| t.dt.starts_with("2025")));
+
+        // Every sample row is source 'test'; filtering by it keeps all of 2025.
+        let source = TransactionFilters {
+            year: Some(2025),
+            source: Some("test".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            list_transactions(&conn, &source, 1, 100).unwrap().0.len(),
+            6
+        );
+        let other = TransactionFilters {
+            source: Some("neon".into()),
+            ..Default::default()
+        };
+        assert_eq!(list_transactions(&conn, &other, 1, 100).unwrap().1, 0);
+
+        // Category filter: the three food rows match 'food' (two in 2025, one in 2024).
+        let food = TransactionFilters {
+            category: Some("food".into()),
+            ..Default::default()
+        };
+        let (items, total) = list_transactions(&conn, &food, 1, 100).unwrap();
+        assert_eq!(total, 3);
+        assert!(
+            items
+                .iter()
+                .all(|t| t.category.as_ref().unwrap().name == "food")
+        );
+    }
+
+    #[test]
+    fn list_transactions_uncategorized_matches_null_category() {
+        let conn = seeded();
+        // A row with no category at all.
+        conn.execute(
+            "INSERT INTO transactions
+                (account_id, source, source_key, dt, description, category_id,
+                 amount_orig, currency_orig, amount_chf, kind)
+             VALUES (1, 'test', 'k-null', '2025-03-01', 'x', NULL, -10.0, 'CHF', -10.0, 'spend')",
+            [],
+        )
+        .unwrap();
+        let uncat = TransactionFilters {
+            category: Some("uncategorized".into()),
+            ..Default::default()
+        };
+        let (items, total) = list_transactions(&conn, &uncat, 1, 100).unwrap();
+        assert_eq!(total, 1);
+        assert!(items[0].category.is_none());
+
+        // A named category excludes the null row.
+        let food = TransactionFilters {
+            category: Some("food".into()),
+            ..Default::default()
+        };
+        let (items, _) = list_transactions(&conn, &food, 1, 100).unwrap();
+        assert!(items.iter().all(|t| t.category.is_some()));
+    }
+
+    #[test]
+    fn list_transactions_paginates() {
+        let conn = seeded();
+        insert_sample(&conn);
+        let filters = TransactionFilters::default();
+        let (page1, total) = list_transactions(&conn, &filters, 1, 3).unwrap();
+        assert_eq!(total, 7);
+        assert_eq!(page1.len(), 3);
+        let (page2, _) = list_transactions(&conn, &filters, 2, 3).unwrap();
+        assert_eq!(page2.len(), 3);
+        let (page3, _) = list_transactions(&conn, &filters, 3, 3).unwrap();
+        assert_eq!(page3.len(), 1);
+        // No overlap between pages.
+        let ids: Vec<i64> = page1
+            .iter()
+            .chain(page2.iter())
+            .chain(page3.iter())
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(
+            ids.len(),
+            ids.into_iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+        );
+    }
+
+    #[test]
+    fn get_transaction_finds_rows_and_returns_none_for_missing() {
+        let conn = seeded();
+        insert_sample(&conn);
+        let id = id_for_key(&conn, "2025-02-14");
+        let got = get_transaction(&conn, id).unwrap().unwrap();
+        assert_eq!(got.dt, "2025-02-14");
+        assert_eq!(got.kind, "spend");
+        assert_eq!(got.amount_chf, -250.5);
+        assert_eq!(got.account, "Neon");
+        assert!(get_transaction(&conn, 999_999).unwrap().is_none());
+    }
+
+    #[test]
+    fn category_id_for_name_resolves_taxonomy_and_rejects_unknown() {
+        let conn = seeded();
+        assert_eq!(
+            category_id_for_name(&conn, "food").unwrap(),
+            category_id_for_name(&conn, "food").unwrap()
+        );
+        assert!(category_id_for_name(&conn, "food").unwrap().is_some());
+        assert!(
+            category_id_for_name(&conn, "not-a-category")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn set_transaction_overrides_category_and_transfer_flag() {
+        let conn = seeded();
+        insert_sample(&conn);
+        let id = id_for_key(&conn, "2025-01-05"); // food, -100.0, spend
+        let dining = category_id_for_name(&conn, "dining").unwrap().unwrap();
+
+        // Change only the category; kind stays spend.
+        let updated = set_transaction(&conn, id, Some(Some(dining)), None).unwrap();
+        assert_eq!(updated, 1);
+        let row = get_transaction(&conn, id).unwrap().unwrap();
+        assert_eq!(row.category.as_ref().unwrap().name, "dining");
+        assert_eq!(row.kind, "spend");
+
+        // Flag as a transfer: negative amount -> transfer_out, is_transfer true.
+        set_transaction(&conn, id, None, Some("transfer_out")).unwrap();
+        let row = get_transaction(&conn, id).unwrap().unwrap();
+        assert_eq!(row.kind, "transfer_out");
+        assert!(row.is_transfer);
+
+        // Unflag: negative amount -> spend again.
+        set_transaction(&conn, id, None, Some("spend")).unwrap();
+        let row = get_transaction(&conn, id).unwrap().unwrap();
+        assert_eq!(row.kind, "spend");
+        assert!(!row.is_transfer);
+
+        // Updating a missing id affects no rows.
+        assert_eq!(
+            set_transaction(&conn, 999_999, Some(Some(dining)), None).unwrap(),
+            0
+        );
+
+        // Clearing the category sets it to NULL (uncategorized).
+        set_transaction(&conn, id, Some(None), None).unwrap();
+        let row = get_transaction(&conn, id).unwrap().unwrap();
+        assert!(row.category.is_none());
+    }
+
+    #[test]
+    fn set_transaction_no_fields_is_a_noop() {
+        let conn = seeded();
+        insert_sample(&conn);
+        let id = id_for_key(&conn, "2025-01-05"); // food, -100.0, spend
+        assert_eq!(set_transaction(&conn, id, None, None).unwrap(), 0);
+        let row = get_transaction(&conn, id).unwrap().unwrap();
+        assert_eq!(row.category.as_ref().unwrap().name, "food");
+        assert_eq!(row.kind, "spend");
+    }
+
+    #[test]
+    fn kind_for_transfer_maps_sign_and_flag() {
+        assert_eq!(kind_for_transfer(-10.0, true), "transfer_out");
+        assert_eq!(kind_for_transfer(10.0, true), "transfer_in");
+        assert_eq!(kind_for_transfer(-10.0, false), "spend");
+        assert_eq!(kind_for_transfer(10.0, false), "income");
+        // Zero is treated as a positive (inflow) amount.
+        assert_eq!(kind_for_transfer(0.0, true), "transfer_in");
+        assert_eq!(kind_for_transfer(0.0, false), "income");
+    }
+
+    #[test]
+    fn set_transaction_positive_amount_maps_to_income_and_transfer_in() {
+        let conn = seeded();
+        insert_sample(&conn);
+        let id = id_for_key(&conn, "2025-01-20"); // income, +1000.0
+        set_transaction(&conn, id, None, Some("transfer_in")).unwrap();
+        let row = get_transaction(&conn, id).unwrap().unwrap();
+        assert_eq!(row.kind, "transfer_in");
+        assert!(row.is_transfer);
+        set_transaction(&conn, id, None, Some("income")).unwrap();
+        let row = get_transaction(&conn, id).unwrap().unwrap();
+        assert_eq!(row.kind, "income");
     }
 }

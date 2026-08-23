@@ -3,10 +3,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::get;
+use axum::routing::{get, patch};
 use serde::Deserialize;
 use tower_http::services::{ServeDir, ServeFile};
 
@@ -28,6 +28,8 @@ fn app(state: AppState) -> Router {
         .route("/api/series/cumulative", get(cumulative_series))
         .route("/api/series/daily", get(daily_series))
         .route("/api/categories", get(categories))
+        .route("/api/transactions", get(list_transactions))
+        .route("/api/transactions/{id}", patch(patch_transaction))
         .route("/api/fx", get(fx_spot))
         .route("/api/{*unmatched}", get(api_not_found))
         .fallback_service(spa)
@@ -145,6 +147,168 @@ async fn meta(state: State<Arc<AppState>>) -> Response {
         Ok(serde_json::to_value(meta)?)
     })
     .await
+}
+
+/// Query params for the transaction list. Everything is optional; `month`
+/// (1-12), `category` (a taxonomy name) and the paging bounds are validated.
+#[derive(Debug, Deserialize)]
+struct TransactionQuery {
+    #[serde(default)]
+    year: Option<i32>,
+    #[serde(default)]
+    month: Option<u32>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    category: Option<String>,
+    #[serde(default)]
+    page: Option<u32>,
+    #[serde(default)]
+    page_size: Option<u32>,
+}
+
+const DEFAULT_PAGE_SIZE: u32 = 50;
+const MAX_PAGE_SIZE: u32 = 200;
+
+fn valid_category(name: &str) -> bool {
+    spend_core::schema::CATEGORIES
+        .iter()
+        .any(|(n, _)| *n == name)
+}
+
+async fn list_transactions(
+    state: State<Arc<AppState>>,
+    query: Query<TransactionQuery>,
+) -> Response {
+    if let Some(month) = query.month
+        && !valid_month(month)
+    {
+        return (StatusCode::BAD_REQUEST, "month must be between 1 and 12").into_response();
+    }
+    if let Some(category) = &query.category
+        && !valid_category(category)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("unknown category '{category}'"),
+        )
+            .into_response();
+    }
+    let page = query.page.unwrap_or(1);
+    if page < 1 {
+        return (StatusCode::BAD_REQUEST, "page must be >= 1").into_response();
+    }
+    let page_size = query.page_size.unwrap_or(DEFAULT_PAGE_SIZE);
+    if !(1..=MAX_PAGE_SIZE).contains(&page_size) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("page_size must be between 1 and {MAX_PAGE_SIZE}"),
+        )
+            .into_response();
+    }
+
+    let filters = spend_core::queries::TransactionFilters {
+        year: query.year,
+        month: query.month,
+        source: query.source.clone(),
+        category: query.category.clone(),
+    };
+    run_query(state, move |conn| {
+        let (items, total) =
+            spend_core::queries::list_transactions(conn, &filters, page, page_size)?;
+        let pages = if total == 0 {
+            0
+        } else {
+            (total + page_size as i64 - 1) / page_size as i64
+        };
+        Ok(serde_json::json!({
+            "items": items,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "pages": pages,
+        }))
+    })
+    .await
+}
+
+/// Body for `PATCH /api/transactions/{id}`. At least one field must be set.
+#[derive(Debug, Deserialize)]
+struct OverrideBody {
+    #[serde(default)]
+    category: Option<String>,
+    #[serde(default)]
+    is_transfer: Option<bool>,
+}
+
+/// The outcome of a patch, mapped to distinct status codes.
+enum PatchOutcome {
+    Updated(serde_json::Value),
+    NotFound,
+    BadCategory(String),
+}
+
+fn patch_work(
+    db_path: PathBuf,
+    id: i64,
+    category: Option<String>,
+    is_transfer: Option<bool>,
+) -> anyhow::Result<PatchOutcome> {
+    let conn = spend_core::db::api_write_connection(&db_path)?;
+    let row = match spend_core::queries::get_transaction(&conn, id)? {
+        Some(row) => row,
+        None => return Ok(PatchOutcome::NotFound),
+    };
+    // Tri-state category: not provided -> keep, "uncategorized" -> NULL,
+    // a taxonomy name -> its id.
+    let category_override: Option<Option<i64>> = match &category {
+        Some(name) => match name.as_str() {
+            "uncategorized" => Some(None),
+            _ => match spend_core::queries::category_id_for_name(&conn, name)? {
+                Some(cid) => Some(Some(cid)),
+                None => return Ok(PatchOutcome::BadCategory(name.clone())),
+            },
+        },
+        None => None,
+    };
+    let new_kind = is_transfer
+        .map(|flag| spend_core::queries::kind_for_transfer(row.amount_chf, flag).to_string());
+    spend_core::queries::set_transaction(&conn, id, category_override, new_kind.as_deref())?;
+    let updated = spend_core::queries::get_transaction(&conn, id)?
+        .ok_or_else(|| anyhow::anyhow!("transaction {id} vanished after update"))?;
+    Ok(PatchOutcome::Updated(serde_json::to_value(updated)?))
+}
+
+async fn patch_transaction(
+    state: State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(body): Json<OverrideBody>,
+) -> Response {
+    if body.category.is_none() && body.is_transfer.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "provide category and/or is_transfer",
+        )
+            .into_response();
+    }
+    let db_path = state.db_path.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        patch_work(db_path, id, body.category, body.is_transfer)
+    })
+    .await;
+    match result {
+        Ok(Ok(PatchOutcome::Updated(json))) => Json(json).into_response(),
+        Ok(Ok(PatchOutcome::NotFound)) => {
+            (StatusCode::NOT_FOUND, "transaction not found").into_response()
+        }
+        Ok(Ok(PatchOutcome::BadCategory(name))) => (
+            StatusCode::BAD_REQUEST,
+            format!("unknown category '{name}'"),
+        )
+            .into_response(),
+        Ok(Err(err)) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
 }
 
 /// The target currency; missing or malformed values are 400s via `Query`.
@@ -682,6 +846,235 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    async fn patch_raw(app: &Router, uri: &str, body: &serde_json::Value) -> (StatusCode, Vec<u8>) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, bytes.to_vec())
+    }
+
+    async fn patch_json(
+        app: &Router,
+        uri: &str,
+        body: &serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let (status, bytes) = patch_raw(app, uri, body).await;
+        (
+            status,
+            serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| panic!("non-JSON response from {uri}: {bytes:?}")),
+        )
+    }
+
+    fn tx_id(db: &std::path::Path, key: &str) -> i64 {
+        let conn = spend_core::db::ingest_connection(db).unwrap();
+        conn.query_row(
+            "SELECT id FROM transactions WHERE source_key = ?",
+            [key],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn transactions_list_filters_by_period_source_and_category() {
+        let (dir, db) = temp_db();
+        seed_transactions(&db);
+        let app = test_app(db);
+
+        // No filter: all nine rows, newest first.
+        let (status, json) = get(&app, "/api/transactions").await;
+        assert_eq!(status, StatusCode::OK, "body: {json:?}");
+        assert_eq!(json["total"], 9);
+        let items = json["items"].as_array().unwrap();
+        assert_eq!(items.len(), 9);
+        assert_eq!(items[0]["dt"], "2025-12-31");
+        assert_eq!(items[0]["category"]["name"], "food");
+
+        // Year and month period filters.
+        let (_, json) = get(&app, "/api/transactions?year=2025").await;
+        assert_eq!(json["total"], 8);
+        let (_, json) = get(&app, "/api/transactions?year=2025&month=1").await;
+        assert_eq!(json["total"], 4);
+        let (_, json) = get(&app, "/api/transactions?year=2024").await;
+        assert_eq!(json["total"], 1);
+
+        // Source filter: all rows are 'test'; 'neon' matches nothing.
+        let (_, json) = get(&app, "/api/transactions?source=test&year=2024").await;
+        assert_eq!(json["total"], 1);
+        let (_, json) = get(&app, "/api/transactions?source=neon").await;
+        assert_eq!(json["total"], 0);
+
+        // Category filter: three food rows.
+        let (_, json) = get(&app, "/api/transactions?category=food").await;
+        assert_eq!(json["total"], 3);
+        for item in json["items"].as_array().unwrap() {
+            assert_eq!(item["category"]["name"], "food");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn transactions_list_paginates_and_reports_pages() {
+        let (dir, db) = temp_db();
+        seed_transactions(&db);
+        let app = test_app(db);
+        let (_, json) = get(&app, "/api/transactions?page_size=4&page=1").await;
+        assert_eq!(json["total"], 9);
+        assert_eq!(json["pages"], 3);
+        assert_eq!(json["page"], 1);
+        assert_eq!(json["items"].as_array().unwrap().len(), 4);
+        let (_, json) = get(&app, "/api/transactions?page_size=4&page=3").await;
+        assert_eq!(json["items"].as_array().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn transactions_list_validates_month_category_and_paging() {
+        let (dir, db) = temp_db();
+        seed_transactions(&db);
+        let app = test_app(db);
+        for uri in [
+            "/api/transactions?month=13",
+            "/api/transactions?month=0",
+            "/api/transactions?category=not-a-category",
+            "/api/transactions?page=0",
+            "/api/transactions?page_size=0",
+            "/api/transactions?page_size=1000",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(StatusCode::BAD_REQUEST, response.status(), "uri: {uri}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn patch_category_persists_and_shifts_category_breakdown() {
+        let (dir, db) = temp_db();
+        seed_transactions(&db);
+        let app = test_app(db.clone());
+        let id = tx_id(&db, "k1"); // food, -100.0, spend, 2025
+
+        let (status, json) = patch_json(
+            &app,
+            &format!("/api/transactions/{id}"),
+            &serde_json::json!({ "category": "dining" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {json:?}");
+        assert_eq!(json["category"]["name"], "dining");
+        assert_eq!(json["kind"], "spend");
+
+        // Persists on a fresh (read-only) connection and moves the spend from
+        // food to dining in the 2025 breakdown.
+        let (status, json) = get(&app, "/api/categories?year=2025").await;
+        assert_eq!(status, StatusCode::OK, "body: {json:?}");
+        let slices = json.as_array().unwrap();
+        let food: f64 = slices.iter().find(|s| s["name"] == "food").unwrap()["value"]
+            .as_f64()
+            .unwrap();
+        let dining: f64 = slices.iter().find(|s| s["name"] == "dining").unwrap()["value"]
+            .as_f64()
+            .unwrap();
+        // food lost k1 (100.0): 75.25 remains; dining gained it.
+        assert_eq!(food, 75.25);
+        assert_eq!(dining, 100.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn patch_transfer_flag_excludes_row_from_spend_kpi() {
+        let (dir, db) = temp_db();
+        seed_transactions(&db);
+        let app = test_app(db.clone());
+        let id = tx_id(&db, "k4"); // travel, -250.5, spend, 2025
+
+        // 2025 spend is 425.75 before the override.
+        let (_, before) = get(&app, "/api/summary?year=2025").await;
+        assert_eq!(before["spend"], 425.75);
+
+        let (status, json) = patch_json(
+            &app,
+            &format!("/api/transactions/{id}"),
+            &serde_json::json!({ "is_transfer": true }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {json:?}");
+        assert_eq!(json["kind"], "transfer_out");
+        assert_eq!(json["is_transfer"], true);
+
+        // The row no longer counts as spend.
+        let (_, after) = get(&app, "/api/summary?year=2025").await;
+        assert_eq!(after["spend"], 425.75 - 250.5);
+
+        // Toggling back restores the spend.
+        let (status, _) = patch_json(
+            &app,
+            &format!("/api/transactions/{id}"),
+            &serde_json::json!({ "is_transfer": false }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, restored) = get(&app, "/api/summary?year=2025").await;
+        assert_eq!(restored["spend"], 425.75);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn patch_transaction_rejects_unknown_id_empty_body_and_bad_category() {
+        let (dir, db) = temp_db();
+        seed_transactions(&db);
+        let app = test_app(db.clone());
+        let id = tx_id(&db, "k1");
+
+        // Unknown id -> 404.
+        let (status, _) = patch_raw(
+            &app,
+            "/api/transactions/999999",
+            &serde_json::json!({ "category": "dining" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Empty body -> 400.
+        let (status, _) = patch_raw(
+            &app,
+            &format!("/api/transactions/{id}"),
+            &serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Unknown category -> 400, and the row is unchanged.
+        let (status, _) = patch_raw(
+            &app,
+            &format!("/api/transactions/{id}"),
+            &serde_json::json!({ "category": "not-a-category" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (_, json) = get(&app, "/api/transactions?category=food").await;
+        assert_eq!(json["total"], 3);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
