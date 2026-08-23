@@ -13,6 +13,7 @@ use tower_http::services::{ServeDir, ServeFile};
 #[derive(Clone)]
 struct AppState {
     db_path: PathBuf,
+    fx: spend_core::fx::Fx,
 }
 
 fn app(state: AppState) -> Router {
@@ -27,6 +28,7 @@ fn app(state: AppState) -> Router {
         .route("/api/series/cumulative", get(cumulative_series))
         .route("/api/series/daily", get(daily_series))
         .route("/api/categories", get(categories))
+        .route("/api/fx", get(fx_spot))
         .route("/api/{*unmatched}", get(api_not_found))
         .fallback_service(spa)
         .with_state(Arc::new(state))
@@ -145,6 +147,31 @@ async fn meta(state: State<Arc<AppState>>) -> Response {
     .await
 }
 
+/// The target currency; missing or malformed values are 400s via `Query`.
+#[derive(Debug, Deserialize)]
+struct FxQuery {
+    to: String,
+}
+
+/// Today's CHF -> `to` spot rate in a single upstream frankfurter call.
+/// CHF is the identity and only USD/EUR targets exist.
+async fn fx_spot(state: State<Arc<AppState>>, query: Query<FxQuery>) -> Response {
+    let to = query.to.trim().to_ascii_uppercase();
+    if to != "USD" && to != "EUR" {
+        return (StatusCode::BAD_REQUEST, "to must be USD or EUR").into_response();
+    }
+    match state.fx.spot_rate(&to).await {
+        Ok((rate, date)) => Json(serde_json::json!({
+            "from": "CHF",
+            "to": to,
+            "rate": rate,
+            "date": date,
+        }))
+        .into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, format!("fx: {err}")).into_response(),
+    }
+}
+
 async fn api_not_found() -> (StatusCode, &'static str) {
     (StatusCode::NOT_FOUND, "not found")
 }
@@ -160,7 +187,10 @@ async fn main() -> anyhow::Result<()> {
 
     let config = spend_core::config::Config::load()?;
     let db_path = config.db_path.clone();
-    let state = AppState { db_path };
+    let state = AppState {
+        db_path,
+        fx: spend_core::fx::Fx::new(config.fx_base_url),
+    };
     if !PathBuf::from("frontend/dist/index.html").exists() {
         eprintln!("warning: frontend/dist is missing; build it with `pnpm --dir frontend build`");
     }
@@ -190,6 +220,56 @@ mod tests {
 
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+    /// App with an FX client pointed at a dead port; DB-only tests never
+    /// trigger upstream calls.
+    fn test_app(db_path: std::path::PathBuf) -> Router {
+        app(AppState {
+            db_path,
+            fx: spend_core::fx::Fx::new("http://127.0.0.1:1"),
+        })
+    }
+
+    /// Minimal single-endpoint frankfurter mock; counts received requests.
+    async fn mock_fx_server(
+        body: &str,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let body = body.to_string();
+        let hits_bg = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                let body = body.clone();
+                let hits = hits_bg.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut chunk = [0u8; 512];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    // `connection: close`: the socket drops when the task ends.
+                });
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
     fn temp_db() -> (std::path::PathBuf, std::path::PathBuf) {
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let dir = std::env::temp_dir().join(format!("spend-api-test-{}-{n}", std::process::id()));
@@ -202,7 +282,7 @@ mod tests {
     async fn meta_reports_seeded_data_and_empty_periods() {
         let (dir, db) = temp_db();
         spend_core::db::ingest_connection(&db).unwrap();
-        let app = app(AppState { db_path: db });
+        let app = test_app(db);
         let response = app
             .oneshot(
                 Request::builder()
@@ -295,7 +375,7 @@ mod tests {
     async fn summary_returns_hand_checked_year_totals() {
         let (dir, db) = temp_db();
         seed_transactions(&db);
-        let app = app(AppState { db_path: db });
+        let app = test_app(db);
         let (status, json) = get(&app, "/api/summary?year=2025").await;
         assert_eq!(status, StatusCode::OK, "body: {json:?}");
         assert_eq!(
@@ -320,7 +400,7 @@ mod tests {
     async fn monthly_series_returns_twelve_points_for_the_year() {
         let (dir, db) = temp_db();
         seed_transactions(&db);
-        let app = app(AppState { db_path: db });
+        let app = test_app(db);
         let (status, json) = get(&app, "/api/series/monthly?year=2025").await;
         assert_eq!(status, StatusCode::OK, "body: {json:?}");
         let months = json.as_array().unwrap();
@@ -339,7 +419,7 @@ mod tests {
     async fn summary_scoped_to_a_single_month() {
         let (dir, db) = temp_db();
         seed_transactions(&db);
-        let app = app(AppState { db_path: db });
+        let app = test_app(db);
         let (status, json) = get(&app, "/api/summary?year=2025&month=1").await;
         assert_eq!(status, StatusCode::OK, "body: {json:?}");
         assert_eq!(
@@ -365,7 +445,7 @@ mod tests {
     async fn yearly_series_returns_every_year_oldest_first() {
         let (dir, db) = temp_db();
         seed_transactions(&db);
-        let app1 = app(AppState { db_path: db });
+        let app1 = test_app(db);
         let (status, json) = get(&app1, "/api/series/yearly").await;
         assert_eq!(status, StatusCode::OK, "body: {json:?}");
         assert_eq!(
@@ -378,7 +458,7 @@ mod tests {
 
         let (dir2, db2) = temp_db();
         spend_core::db::ingest_connection(&db2).unwrap();
-        let app2 = app(AppState { db_path: db2 });
+        let app2 = test_app(db2);
         let (status, json) = get(&app2, "/api/series/yearly").await;
         assert_eq!(status, StatusCode::OK, "body: {json:?}");
         assert!(json.as_array().unwrap().is_empty());
@@ -390,7 +470,7 @@ mod tests {
     async fn cumulative_series_runs_up_within_the_year() {
         let (dir, db) = temp_db();
         seed_transactions(&db);
-        let app = app(AppState { db_path: db });
+        let app = test_app(db);
         let (status, json) = get(&app, "/api/series/cumulative?year=2025").await;
         assert_eq!(status, StatusCode::OK, "body: {json:?}");
         let points = json.as_array().unwrap();
@@ -418,7 +498,7 @@ mod tests {
     async fn daily_series_covers_every_day_of_the_month() {
         let (dir, db) = temp_db();
         seed_transactions(&db);
-        let app = app(AppState { db_path: db });
+        let app = test_app(db);
         let (status, json) = get(&app, "/api/series/daily?year=2025&month=2").await;
         assert_eq!(status, StatusCode::OK, "body: {json:?}");
         let days = json.as_array().unwrap();
@@ -439,7 +519,7 @@ mod tests {
     async fn categories_scoped_to_a_single_month() {
         let (dir, db) = temp_db();
         seed_transactions(&db);
-        let app = app(AppState { db_path: db });
+        let app = test_app(db);
         let (status, json) = get(&app, "/api/categories?year=2025&month=2").await;
         assert_eq!(status, StatusCode::OK, "body: {json:?}");
         assert_eq!(
@@ -460,7 +540,7 @@ mod tests {
     async fn categories_returns_breakdown_with_colors_and_percentages() {
         let (dir, db) = temp_db();
         seed_transactions(&db);
-        let app = app(AppState { db_path: db });
+        let app = test_app(db);
         let (status, json) = get(&app, "/api/categories?year=2025").await;
         assert_eq!(status, StatusCode::OK, "body: {json:?}");
         assert_eq!(
@@ -487,7 +567,7 @@ mod tests {
     async fn endpoints_require_valid_year_and_month_query_params() {
         let (dir, db) = temp_db();
         spend_core::db::ingest_connection(&db).unwrap();
-        let app = app(AppState { db_path: db });
+        let app = test_app(db);
         for uri in [
             "/api/summary",
             "/api/series/monthly",
@@ -501,6 +581,9 @@ mod tests {
             "/api/summary?year=abcd",
             "/api/summary?year=2025&month=abcd",
             "/api/series/cumulative?year=2025&month=abc",
+            "/api/fx",
+            "/api/fx?to=",
+            "/api/fx?to=GBP",
         ] {
             let response = app
                 .clone()
@@ -513,10 +596,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fx_endpoint_returns_today_spot_from_a_single_upstream_call() {
+        let (dir, db) = temp_db();
+        spend_core::db::ingest_connection(&db).unwrap();
+        let (base, hits) = mock_fx_server(
+            r#"{"name":"Frankfurter API","date":"2026-08-22","base":"CHF","rates":{"USD":0.79,"EUR":0.86}}"#,
+        )
+        .await;
+        let app = app(AppState {
+            db_path: db,
+            fx: spend_core::fx::Fx::new(base),
+        });
+        let (status, json) = get(&app, "/api/fx?to=USD").await;
+        assert_eq!(status, StatusCode::OK, "body: {json:?}");
+        assert_eq!(
+            json,
+            serde_json::json!({ "from": "CHF", "to": "USD", "rate": 0.79, "date": "2026-08-22" })
+        );
+        let (status, json) = get(&app, "/api/fx?to=eur").await;
+        assert_eq!(status, StatusCode::OK, "body: {json:?}");
+        assert_eq!(
+            json,
+            serde_json::json!({ "from": "CHF", "to": "EUR", "rate": 0.86, "date": "2026-08-22" })
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "each endpoint hit must cost exactly one upstream call"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn fx_endpoint_rejects_unknown_targets_without_upstream_calls() {
+        let (dir, db) = temp_db();
+        spend_core::db::ingest_connection(&db).unwrap();
+        let (base, hits) = mock_fx_server(r#"{"date":"2026-08-22","rates":{}}"#).await;
+        let app = app(AppState {
+            db_path: db,
+            fx: spend_core::fx::Fx::new(base),
+        });
+        for uri in ["/api/fx", "/api/fx?to=", "/api/fx?to=GBP"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(StatusCode::BAD_REQUEST, response.status(), "uri: {uri}");
+        }
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "rejected targets must not reach the upstream"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn unknown_api_routes_get_404() {
         let (dir, db) = temp_db();
         spend_core::db::ingest_connection(&db).unwrap();
-        let app = app(AppState { db_path: db });
+        let app = test_app(db);
         let response = app
             .oneshot(
                 Request::builder()

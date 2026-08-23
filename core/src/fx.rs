@@ -6,6 +6,7 @@ use serde::Deserialize;
 
 /// Monthly-average FX rates sourced from frankfurter.dev (ECB reference rates),
 /// cached in the `fx_rates` table so re-ingests work offline.
+#[derive(Clone)]
 pub struct Fx {
     http: reqwest::Client,
     base_url: String,
@@ -15,6 +16,14 @@ pub struct Fx {
 struct FrankfurterResponse {
     #[serde(default)]
     rates: BTreeMap<String, BTreeMap<String, f64>>,
+}
+
+#[derive(Deserialize)]
+struct LatestResponse {
+    #[serde(default)]
+    date: String,
+    #[serde(default)]
+    rates: BTreeMap<String, f64>,
 }
 
 impl Fx {
@@ -94,6 +103,37 @@ impl Fx {
             duckdb::params!(first.format("%Y-%m-%d").to_string(), from, to, rate),
         )?;
         Ok(rate)
+    }
+
+    /// Today's spot rate for 1 CHF in `to` from a single `/v1/latest`
+    /// upstream call (ECB reference rate, `date` is the day it was
+    /// published). CHF is the identity.
+    pub async fn spot_rate(&self, to: &str) -> anyhow::Result<(f64, String)> {
+        let to = normalize(to);
+        if to == "CHF" {
+            let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+            return Ok((1.0, date));
+        }
+        let url = format!("{}/v1/latest?base=CHF&symbols={to}", self.base_url);
+        let response: LatestResponse = self
+            .http
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let rate = Self::spot(&response.rates, &to)?;
+        anyhow::ensure!(!response.date.is_empty(), "no date in frankfurter response");
+        Ok((rate, response.date))
+    }
+
+    /// Pick the `to` rate out of a latest-response rates map.
+    pub fn spot(rates: &BTreeMap<String, f64>, to: &str) -> anyhow::Result<f64> {
+        rates
+            .get(&normalize(to))
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("no {to} rate in response"))
     }
 
     /// Keep only the days inside `[start, end]`; malformed dates are dropped.
@@ -202,6 +242,16 @@ mod tests {
         let (s, e) = month_bounds(NaiveDate::from_ymd_opt(2020, 1, 15).unwrap());
         assert_eq!(s, NaiveDate::from_ymd_opt(2020, 1, 1).unwrap());
         assert_eq!(e, NaiveDate::from_ymd_opt(2020, 1, 31).unwrap());
+    }
+
+    #[test]
+    fn spot_picks_the_target_rate() {
+        let mut rates = BTreeMap::new();
+        rates.insert("USD".to_string(), 0.79f64);
+        rates.insert("EUR".to_string(), 0.86f64);
+        assert_eq!(Fx::spot(&rates, "usd").unwrap(), 0.79);
+        assert_eq!(Fx::spot(&rates, "EUR").unwrap(), 0.86);
+        assert!(Fx::spot(&rates, "GBP").is_err());
     }
 
     #[test]

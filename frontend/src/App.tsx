@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react"
+import { useEffect, useRef, useState, type ReactNode } from "react"
 import {
   Bar,
   BarChart,
@@ -98,6 +98,12 @@ interface DashboardData {
 
 type View = "month" | "year"
 type Granularity = "month" | "day"
+type Currency = "CHF" | "USD" | "EUR"
+
+interface FxState {
+  rate: number
+  date: string
+}
 
 const MONTH_LABELS = [
   "Jan",
@@ -114,19 +120,32 @@ const MONTH_LABELS = [
   "Dec",
 ]
 
-const chf = new Intl.NumberFormat("de-CH", {
-  style: "currency",
-  currency: "CHF",
-})
+const CURRENCIES: readonly Currency[] = ["CHF", "USD", "EUR"]
 
-const chfCompact = new Intl.NumberFormat("de-CH", {
+// currencyDisplay "code" keeps every currency rendered as `CHF 1'234.56`
+// / `USD 1'234.56` / `EUR 1'234.56`, matching the pixel app's style.
+const moneyFormatters: Record<Currency, Intl.NumberFormat> = {
+  CHF: new Intl.NumberFormat("de-CH", {
+    style: "currency",
+    currency: "CHF",
+    currencyDisplay: "code",
+  }),
+  USD: new Intl.NumberFormat("de-CH", {
+    style: "currency",
+    currency: "USD",
+    currencyDisplay: "code",
+  }),
+  EUR: new Intl.NumberFormat("de-CH", {
+    style: "currency",
+    currency: "EUR",
+    currencyDisplay: "code",
+  }),
+}
+
+const compactNumber = new Intl.NumberFormat("de-CH", {
   notation: "compact",
   maximumFractionDigits: 1,
 })
-
-function formatChf(value: number) {
-  return chf.format(value)
-}
 
 function periodLabel(view: View, year: number, month: number) {
   return view === "month" ? `${MONTH_LABELS[month - 1]} ${year}` : String(year)
@@ -195,15 +214,29 @@ function Segmented<T extends string>({
   )
 }
 
-function KpiCard({ label, value, period }: { label: string; value: number; period: string }) {
+function KpiCard({
+  label,
+  value,
+  period,
+  currency,
+  format,
+}: {
+  label: string
+  value: number
+  period: string
+  currency: Currency
+  format: (value: number) => string
+}) {
   return (
     <Card className="animate-step-in">
       <CardContent className="p-6">
         <div className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
           {label}
         </div>
-        <div className="mt-2 font-pixel text-3xl leading-none">{formatChf(value)}</div>
-        <div className="mt-2 font-mono text-xs text-muted-foreground">CHF · {period}</div>
+        <div className="mt-2 font-pixel text-3xl leading-none">{format(value)}</div>
+        <div className="mt-2 font-mono text-xs text-muted-foreground">
+          {currency} · {period}
+        </div>
       </CardContent>
     </Card>
   )
@@ -228,7 +261,17 @@ function ChartLabel({ children }: { children: ReactNode }) {
   )
 }
 
-function YearlySpendChart({ year, points }: { year: number; points: YearlyPoint[] }) {
+function YearlySpendChart({
+  year,
+  points,
+  format,
+  compact,
+}: {
+  year: number
+  points: YearlyPoint[]
+  format: (value: number) => string
+  compact: (value: number) => string
+}) {
   const data = points.map((point) => ({
     label: String(point.year),
     year: point.year,
@@ -249,13 +292,13 @@ function YearlySpendChart({ year, points }: { year: number; points: YearlyPoint[
           tickLine={false}
           axisLine={false}
           width={44}
-          tickFormatter={(value: number) => chfCompact.format(value)}
+          tickFormatter={(value: number) => compact(value)}
           tick={axisTick}
         />
         <Tooltip
           cursor={{ fill: "var(--muted)" }}
           contentStyle={tooltipStyle}
-          formatter={(value) => [formatChf(Number(value)), "spend"]}
+          formatter={(value) => [format(Number(value)), "spend"]}
         />
         <Bar dataKey="spend" stroke="var(--border)" strokeWidth={2} isAnimationActive={false}>
           {data.map((point) => (
@@ -270,7 +313,17 @@ function YearlySpendChart({ year, points }: { year: number; points: YearlyPoint[
   )
 }
 
-function CumulativeChart({ year, points }: { year: number; points: CumulativePoint[] }) {
+function CumulativeChart({
+  year,
+  points,
+  format,
+  compact,
+}: {
+  year: number
+  points: CumulativePoint[]
+  format: (value: number) => string
+  compact: (value: number) => string
+}) {
   const data = points.map((point) => ({
     label: MONTH_LABELS[point.month - 1],
     cumulative: point.cumulative,
@@ -290,13 +343,13 @@ function CumulativeChart({ year, points }: { year: number; points: CumulativePoi
           tickLine={false}
           axisLine={false}
           width={44}
-          tickFormatter={(value: number) => chfCompact.format(value)}
+          tickFormatter={(value: number) => compact(value)}
           tick={axisTick}
         />
         <Tooltip
           cursor={{ stroke: "var(--border)" }}
           contentStyle={tooltipStyle}
-          formatter={(value) => [formatChf(Number(value)), "cumulative"]}
+          formatter={(value) => [format(Number(value)), "cumulative"]}
           labelFormatter={(label) => `${label} ${year}`}
         />
         <Line
@@ -317,10 +370,14 @@ function MonthlySpendChart({
   year,
   months,
   selectedMonth,
+  format,
+  compact,
 }: {
   year: number
   months: MonthlyPoint[]
   selectedMonth: number
+  format: (value: number) => string
+  compact: (value: number) => string
 }) {
   const data = months.map((point) => ({
     label: MONTH_LABELS[point.month - 1],
@@ -342,13 +399,13 @@ function MonthlySpendChart({
           tickLine={false}
           axisLine={false}
           width={44}
-          tickFormatter={(value: number) => chfCompact.format(value)}
+          tickFormatter={(value: number) => compact(value)}
           tick={axisTick}
         />
         <Tooltip
           cursor={{ fill: "var(--muted)" }}
           contentStyle={tooltipStyle}
-          formatter={(value) => [formatChf(Number(value)), "spend"]}
+          formatter={(value) => [format(Number(value)), "spend"]}
           labelFormatter={(label) => `${label} ${year}`}
         />
         <Bar dataKey="spend" stroke="var(--border)" strokeWidth={2} isAnimationActive={false}>
@@ -368,10 +425,14 @@ function DailySpendChart({
   year,
   month,
   days,
+  format,
+  compact,
 }: {
   year: number
   month: number
   days: DailyPoint[]
+  format: (value: number) => string
+  compact: (value: number) => string
 }) {
   const data = days.map((point) => ({
     label: String(point.day),
@@ -392,13 +453,13 @@ function DailySpendChart({
           tickLine={false}
           axisLine={false}
           width={44}
-          tickFormatter={(value: number) => chfCompact.format(value)}
+          tickFormatter={(value: number) => compact(value)}
           tick={axisTick}
         />
         <Tooltip
           cursor={{ fill: "var(--muted)" }}
           contentStyle={tooltipStyle}
-          formatter={(value) => [formatChf(Number(value)), "spend"]}
+          formatter={(value) => [format(Number(value)), "spend"]}
           labelFormatter={(label) => `${MONTH_LABELS[month - 1]} ${label} ${year}`}
         />
         <Bar
@@ -413,7 +474,13 @@ function DailySpendChart({
   )
 }
 
-function CategoryDonut({ slices }: { slices: CategorySlice[] }) {
+function CategoryDonut({
+  slices,
+  format,
+}: {
+  slices: CategorySlice[]
+  format: (value: number) => string
+}) {
   if (slices.length === 0) {
     return (
       <div className="flex h-72 items-center justify-center font-mono text-sm text-muted-foreground">
@@ -443,7 +510,7 @@ function CategoryDonut({ slices }: { slices: CategorySlice[] }) {
             </Pie>
             <Tooltip
               contentStyle={tooltipStyle}
-              formatter={(value, name) => [formatChf(Number(value)), String(name)]}
+              formatter={(value, name) => [format(Number(value)), String(name)]}
             />
           </PieChart>
         </ResponsiveContainer>
@@ -460,7 +527,7 @@ function CategoryDonut({ slices }: { slices: CategorySlice[] }) {
               style={{ backgroundColor: slice.color }}
             />
             <span className="truncate">{slice.name}</span>
-            <span className="ml-auto whitespace-nowrap">{formatChf(slice.value)}</span>
+            <span className="ml-auto whitespace-nowrap">{format(slice.value)}</span>
             <span className="w-12 text-right text-muted-foreground">
               {slice.percentage.toFixed(1)}%
             </span>
@@ -505,6 +572,36 @@ export default function App() {
   const [month, setMonth] = useState<number | null>(null)
   const [data, setData] = useState<DashboardData | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [currency, setCurrency] = useState<Currency>("CHF")
+  const [fx, setFx] = useState<Partial<Record<Currency, FxState>>>({})
+  const fxRequests = useRef(new Map<Currency, Promise<void>>())
+  const lastGoodCurrency = useRef<Currency>("CHF")
+
+  // One /api/fx call per currency, cached for the session: re-renders and
+  // re-toggles within the same currency never hit the FX endpoint again.
+  useEffect(() => {
+    if (currency === "CHF") return
+    if (fx[currency] !== undefined) {
+      lastGoodCurrency.current = currency
+      return
+    }
+    let request = fxRequests.current.get(currency)
+    if (!request) {
+      request = getJson<FxState>(`/api/fx?to=${currency}`)
+        .then((state) => {
+          setFx((prev) => ({ ...prev, [currency]: state }))
+          lastGoodCurrency.current = currency
+        })
+        .catch((err: unknown) => {
+          setError(`fx: ${err instanceof Error ? err.message : String(err)}`)
+          setCurrency(lastGoodCurrency.current)
+        })
+        .finally(() => {
+          fxRequests.current.delete(currency)
+        })
+      fxRequests.current.set(currency, request)
+    }
+  }, [currency, fx])
 
   useEffect(() => {
     let cancelled = false
@@ -571,7 +668,14 @@ export default function App() {
     data.summary.month === expectedMonth
       ? data
       : null
-  const loading = year !== null && month !== null && error === null && current === null
+  const fxReady = currency === "CHF" || fx[currency] !== undefined
+  const rate = fx[currency]?.rate ?? 1
+  // CHF values come straight from the API; other currencies are converted
+  // display-only, so switching back to CHF restores the originals exactly.
+  const format = (value: number) => moneyFormatters[currency].format(value * rate)
+  const compact = (value: number) => compactNumber.format(value * rate)
+  const loading =
+    year !== null && month !== null && error === null && (current === null || !fxReady)
   const label = year !== null && month !== null ? periodLabel(view, year, month) : "…"
   const summary = current?.summary ?? null
   const slices = current?.slices ?? []
@@ -586,6 +690,11 @@ export default function App() {
             yearly-spend<span className="animate-step-blink">_</span>
           </h1>
           <div className="flex flex-wrap items-center gap-3">
+            <Segmented
+              options={CURRENCIES.map((code) => ({ value: code, label: code }))}
+              value={currency}
+              onChange={setCurrency}
+            />
             <Segmented
               options={[
                 { value: "month", label: "month" },
@@ -644,10 +753,22 @@ export default function App() {
       ) : (
         <main className="flex-1 px-6 py-8">
           <div className="mx-auto flex w-full max-w-5xl flex-col gap-6">
-            {year !== null && month !== null && (
+            {current !== null && fxReady && (
               <div className="grid grid-cols-1 gap-6 sm:grid-cols-2">
-                <KpiCard label="income" value={summary?.income ?? 0} period={label} />
-                <KpiCard label="spend" value={summary?.spend ?? 0} period={label} />
+                <KpiCard
+                  label="income"
+                  value={current.summary.income}
+                  period={label}
+                  currency={currency}
+                  format={format}
+                />
+                <KpiCard
+                  label="spend"
+                  value={current.summary.spend}
+                  period={label}
+                  currency={currency}
+                  format={format}
+                />
               </div>
             )}
 
@@ -657,7 +778,7 @@ export default function App() {
                   <CardHeader>
                     <CardTitle className="text-lg">yearly spend</CardTitle>
                     <CardDescription>
-                      CHF · totals per year + cumulative {year ?? "…"}
+                      {currency} · totals per year + cumulative {year ?? "…"}
                     </CardDescription>
                   </CardHeader>
                   <CardContent className="flex flex-col gap-5">
@@ -669,11 +790,21 @@ export default function App() {
                       <>
                         <div>
                           <ChartLabel>total per year</ChartLabel>
-                          <YearlySpendChart year={year} points={yearData.yearly} />
+                          <YearlySpendChart
+                            year={year}
+                            points={yearData.yearly}
+                            format={format}
+                            compact={compact}
+                          />
                         </div>
                         <div>
                           <ChartLabel>cumulative spend · {year}</ChartLabel>
-                          <CumulativeChart year={year} points={yearData.cumulative} />
+                          <CumulativeChart
+                            year={year}
+                            points={yearData.cumulative}
+                            format={format}
+                            compact={compact}
+                          />
                         </div>
                       </>
                     )}
@@ -686,7 +817,9 @@ export default function App() {
                       <CardTitle className="text-lg">
                         {granularity === "day" ? "daily spend" : "monthly spend"}
                       </CardTitle>
-                      <CardDescription>CHF · {label}</CardDescription>
+                      <CardDescription>
+                        {currency} · {label}
+                      </CardDescription>
                     </div>
                     <Segmented
                       compact
@@ -708,9 +841,17 @@ export default function App() {
                         year={year}
                         months={monthData.months}
                         selectedMonth={month}
+                        format={format}
+                        compact={compact}
                       />
                     ) : (
-                      <DailySpendChart year={year} month={month} days={monthData.days} />
+                      <DailySpendChart
+                        year={year}
+                        month={month}
+                        days={monthData.days}
+                        format={format}
+                        compact={compact}
+                      />
                     )}
                   </CardContent>
                 </Card>
@@ -727,7 +868,7 @@ export default function App() {
                       loading…
                     </div>
                   ) : (
-                    <CategoryDonut slices={slices} />
+                    <CategoryDonut slices={slices} format={format} />
                   )}
                 </CardContent>
               </Card>
