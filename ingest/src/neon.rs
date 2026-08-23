@@ -498,6 +498,7 @@ mod tests {
             llm_model: "mock".to_string(),
             gemini_api_key: None,
             gemini_model: "unused".to_string(),
+            gemini_base_url: "unused".to_string(),
             fx_base_url: "unused".to_string(),
         };
 

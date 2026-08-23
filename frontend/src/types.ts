@@ -1,4 +1,23 @@
 // Data shapes shared by the dashboard (App) and the transactions table.
+
+/** Which chart a pinned selection chip came from (mirrors the API enum). */
+export type ChartKind = "yearly" | "cumulative" | "monthly" | "daily" | "categories"
+
+/**
+ * A pinned chart selection (bar, slice or point) sent with every chat
+ * message. `value` is the raw CHF number from the API, before any
+ * client-side currency conversion.
+ */
+export interface Selection {
+  chart: ChartKind
+  series: string
+  label: string
+  value: number
+  year?: number
+  month?: number
+  category?: string
+}
+
 export interface Category {
   id: number
   name: string

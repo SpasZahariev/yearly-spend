@@ -40,6 +40,7 @@ pub struct Llm {
     base_url: String,
     api_key: String,
     model: String,
+    gemini_base_url: String,
 }
 
 #[derive(Serialize)]
@@ -116,8 +117,6 @@ struct GeminiOutPart {
     text: String,
 }
 
-const GEMINI_API_BASE: &str = "https://geminiapi.googleapis.com/v1beta";
-
 impl Llm {
     pub fn new(cfg: &Config) -> Self {
         Self {
@@ -126,6 +125,7 @@ impl Llm {
             base_url: cfg.llm_base_url.trim_end_matches('/').to_string(),
             api_key: cfg.llm_api_key.clone(),
             model: crate::config::effective_model(cfg),
+            gemini_base_url: cfg.gemini_base_url.trim_end_matches('/').to_string(),
         }
     }
 
@@ -216,7 +216,7 @@ impl Llm {
             .http
             .post(format!(
                 "{}/models/{}:generateContent",
-                GEMINI_API_BASE, self.model
+                self.gemini_base_url, self.model
             ))
             .query(&[("key", &self.api_key)])
             .json(&body)

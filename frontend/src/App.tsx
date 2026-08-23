@@ -14,12 +14,13 @@ import {
   YAxis,
 } from "recharts"
 
+import { ChatSidebar } from "@/components/ChatSidebar"
 import { TransactionsTable } from "@/components/TransactionsTable"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { getJson } from "@/lib/api"
 import { cn } from "@/lib/utils"
-import type { Category } from "@/types"
+import type { Category, Selection } from "@/types"
 
 interface Account {
   id: number
@@ -255,11 +256,13 @@ function YearlySpendChart({
   points,
   format,
   compact,
+  onPin,
 }: {
   year: number
   points: YearlyPoint[]
   format: (value: number) => string
   compact: (value: number) => string
+  onPin: (selection: Selection) => void
 }) {
   const data = points.map((point) => ({
     label: String(point.year),
@@ -289,7 +292,24 @@ function YearlySpendChart({
           contentStyle={tooltipStyle}
           formatter={(value) => [format(Number(value)), "spend"]}
         />
-        <Bar dataKey="spend" stroke="var(--border)" strokeWidth={2} isAnimationActive={false}>
+        <Bar
+          dataKey="spend"
+          stroke="var(--border)"
+          strokeWidth={2}
+          isAnimationActive={false}
+          className="cursor-pointer"
+          onClick={(entry: { payload?: { year: number; spend: number } }) => {
+            const point = entry?.payload
+            if (point === undefined) return
+            onPin({
+              chart: "yearly",
+              series: "spend",
+              label: String(point.year),
+              value: point.spend,
+              year: point.year,
+            })
+          }}
+        >
           {data.map((point) => (
             <Cell
               key={point.year}
@@ -307,19 +327,38 @@ function CumulativeChart({
   points,
   format,
   compact,
+  onPin,
 }: {
   year: number
   points: CumulativePoint[]
   format: (value: number) => string
   compact: (value: number) => string
+  onPin: (selection: Selection) => void
 }) {
   const data = points.map((point) => ({
     label: MONTH_LABELS[point.month - 1],
+    month: point.month,
     cumulative: point.cumulative,
   }))
   return (
     <ResponsiveContainer width="100%" height={176}>
-      <LineChart data={data} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+      <LineChart
+        data={data}
+        margin={{ top: 8, right: 8, bottom: 0, left: 0 }}
+        onClick={(state: { activeLabel?: string | number | undefined }) => {
+          if (typeof state.activeLabel !== "string") return
+          const point = data[MONTH_LABELS.indexOf(state.activeLabel)]
+          if (point === undefined) return
+          onPin({
+            chart: "cumulative",
+            series: "cumulative",
+            label: `${year}-${String(point.month).padStart(2, "0")}`,
+            value: point.cumulative,
+            year,
+            month: point.month,
+          })
+        }}
+      >
         <CartesianGrid vertical={false} stroke="var(--muted)" />
         <XAxis
           dataKey="label"
@@ -361,12 +400,14 @@ function MonthlySpendChart({
   selectedMonth,
   format,
   compact,
+  onPin,
 }: {
   year: number
   months: MonthlyPoint[]
   selectedMonth: number
   format: (value: number) => string
   compact: (value: number) => string
+  onPin: (selection: Selection) => void
 }) {
   const data = months.map((point) => ({
     label: MONTH_LABELS[point.month - 1],
@@ -397,7 +438,25 @@ function MonthlySpendChart({
           formatter={(value) => [format(Number(value)), "spend"]}
           labelFormatter={(label) => `${label} ${year}`}
         />
-        <Bar dataKey="spend" stroke="var(--border)" strokeWidth={2} isAnimationActive={false}>
+        <Bar
+          dataKey="spend"
+          stroke="var(--border)"
+          strokeWidth={2}
+          isAnimationActive={false}
+          className="cursor-pointer"
+          onClick={(entry: { payload?: { month: number; spend: number } }) => {
+            const point = entry?.payload
+            if (point === undefined) return
+            onPin({
+              chart: "monthly",
+              series: "spend",
+              label: `${year}-${String(point.month).padStart(2, "0")}`,
+              value: point.spend,
+              year,
+              month: point.month,
+            })
+          }}
+        >
           {data.map((point) => (
             <Cell
               key={point.month}
@@ -416,15 +475,18 @@ function DailySpendChart({
   days,
   format,
   compact,
+  onPin,
 }: {
   year: number
   month: number
   days: DailyPoint[]
   format: (value: number) => string
   compact: (value: number) => string
+  onPin: (selection: Selection) => void
 }) {
   const data = days.map((point) => ({
     label: String(point.day),
+    day: point.day,
     spend: point.spend,
   }))
   return (
@@ -457,6 +519,19 @@ function DailySpendChart({
           stroke="var(--border)"
           strokeWidth={1}
           isAnimationActive={false}
+          className="cursor-pointer"
+          onClick={(entry: { payload?: { day: number; spend: number } }) => {
+            const point = entry?.payload
+            if (point === undefined) return
+            onPin({
+              chart: "daily",
+              series: "spend",
+              label: `${year}-${String(month).padStart(2, "0")}-${String(point.day).padStart(2, "0")}`,
+              value: point.spend,
+              year,
+              month,
+            })
+          }}
         />
       </BarChart>
     </ResponsiveContainer>
@@ -466,9 +541,15 @@ function DailySpendChart({
 function CategoryDonut({
   slices,
   format,
+  onPin,
+  year,
+  month,
 }: {
   slices: CategorySlice[]
   format: (value: number) => string
+  onPin: (selection: Selection) => void
+  year: number | null
+  month: number | null
 }) {
   if (slices.length === 0) {
     return (
@@ -492,6 +573,20 @@ function CategoryDonut({
               stroke="var(--border)"
               strokeWidth={2}
               isAnimationActive={false}
+              className="cursor-pointer"
+              onClick={(entry: { payload?: { name: string; value: number } }) => {
+                const slice = entry?.payload
+                if (slice === undefined) return
+                onPin({
+                  chart: "categories",
+                  series: "spend",
+                  label: slice.name,
+                  value: slice.value,
+                  year: year ?? undefined,
+                  month: month ?? undefined,
+                  category: slice.name,
+                })
+              }}
             >
               {slices.map((slice) => (
                 <Cell key={slice.name} fill={slice.color} />
@@ -565,8 +660,31 @@ export default function App() {
   const [overrideKey, setOverrideKey] = useState(0)
   const [currency, setCurrency] = useState<Currency>("CHF")
   const [fx, setFx] = useState<Partial<Record<Currency, FxState>>>({})
+  const [selections, setSelections] = useState<Selection[]>([])
   const fxRequests = useRef(new Map<Currency, Promise<void>>())
   const lastGoodCurrency = useRef<Currency>("CHF")
+
+  // Pinning a chart element replaces the pin of its own chart; clicking the
+  // same element again unpins it. Pins are per-tab state, never persisted.
+  function pinSelection(next: Selection) {
+    setSelections((prev) => {
+      const existing = prev.find(
+        (selection) => selection.chart === next.chart && selection.label === next.label,
+      )
+      if (existing !== undefined && existing.value === next.value) {
+        return prev.filter((selection) => selection !== existing)
+      }
+      return [...prev.filter((selection) => selection.chart !== next.chart), next].slice(0, 10)
+    })
+  }
+
+  function unpinSelection(target: Selection) {
+    setSelections((prev) =>
+      prev.filter(
+        (selection) => !(selection.chart === target.chart && selection.label === target.label),
+      ),
+    )
+  }
 
   // One /api/fx call per currency, cached for the session: re-renders and
   // re-toggles within the same currency never hit the FX endpoint again.
@@ -742,151 +860,169 @@ export default function App() {
         </div>
       )}
 
-      {year === null && error === null && years.length === 0 ? (
-        <EmptyState />
-      ) : (
-        <main className="flex-1 px-6 py-8">
-          <div className="mx-auto flex w-full max-w-5xl flex-col gap-6">
-            {current !== null && fxReady && (
-              <div className="grid grid-cols-1 gap-6 sm:grid-cols-3">
-                <KpiCard
-                  label="income"
-                  value={current.summary.income}
-                  period={label}
-                  currency={currency}
-                  format={format}
-                />
-                <KpiCard
-                  label="spend"
-                  value={current.summary.spend}
-                  period={label}
-                  currency={currency}
-                  format={format}
-                />
-                <KpiCard
-                  label="moved"
-                  value={current.summary.moved}
-                  period={label}
-                  currency={currency}
-                  format={format}
-                />
-              </div>
-            )}
-
-            <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-              {view === "year" ? (
-                <Card className="animate-step-in">
-                  <CardHeader>
-                    <CardTitle className="text-lg">yearly spend</CardTitle>
-                    <CardDescription>
-                      {currency} · totals per year + cumulative {year ?? "…"}
-                    </CardDescription>
-                  </CardHeader>
-                  <CardContent className="flex flex-col gap-5">
-                    {loading || year === null || yearData === null ? (
-                      <div className="flex h-72 items-center justify-center font-mono text-sm text-muted-foreground">
-                        loading…
-                      </div>
-                    ) : (
-                      <>
-                        <div>
-                          <ChartLabel>total per year</ChartLabel>
-                          <YearlySpendChart
-                            year={year}
-                            points={yearData.yearly}
-                            format={format}
-                            compact={compact}
-                          />
-                        </div>
-                        <div>
-                          <ChartLabel>cumulative spend · {year}</ChartLabel>
-                          <CumulativeChart
-                            year={year}
-                            points={yearData.cumulative}
-                            format={format}
-                            compact={compact}
-                          />
-                        </div>
-                      </>
-                    )}
-                  </CardContent>
-                </Card>
-              ) : (
-                <Card className="animate-step-in">
-                  <CardHeader className="flex-row items-start justify-between gap-4">
-                    <div className="flex flex-col gap-1.5">
-                      <CardTitle className="text-lg">
-                        {granularity === "day" ? "daily spend" : "monthly spend"}
-                      </CardTitle>
-                      <CardDescription>
-                        {currency} · {label}
-                      </CardDescription>
-                    </div>
-                    <Segmented
-                      compact
-                      options={[
-                        { value: "month", label: "month" },
-                        { value: "day", label: "day" },
-                      ]}
-                      value={granularity}
-                      onChange={setGranularity}
-                    />
-                  </CardHeader>
-                  <CardContent>
-                    {loading || year === null || month === null || monthData === null ? (
-                      <div className="flex h-72 items-center justify-center font-mono text-sm text-muted-foreground">
-                        loading…
-                      </div>
-                    ) : granularity === "month" ? (
-                      <MonthlySpendChart
-                        year={year}
-                        months={monthData.months}
-                        selectedMonth={month}
-                        format={format}
-                        compact={compact}
-                      />
-                    ) : (
-                      <DailySpendChart
-                        year={year}
-                        month={month}
-                        days={monthData.days}
-                        format={format}
-                        compact={compact}
-                      />
-                    )}
-                  </CardContent>
-                </Card>
+      <div className="flex flex-1 flex-col lg:flex-row">
+        {year === null && error === null && years.length === 0 ? (
+          <EmptyState />
+        ) : (
+          <main className="flex-1 px-6 py-8">
+            <div className="mx-auto flex w-full max-w-5xl flex-col gap-6">
+              {current !== null && fxReady && (
+                <div className="grid grid-cols-1 gap-6 sm:grid-cols-3">
+                  <KpiCard
+                    label="income"
+                    value={current.summary.income}
+                    period={label}
+                    currency={currency}
+                    format={format}
+                  />
+                  <KpiCard
+                    label="spend"
+                    value={current.summary.spend}
+                    period={label}
+                    currency={currency}
+                    format={format}
+                  />
+                  <KpiCard
+                    label="moved"
+                    value={current.summary.moved}
+                    period={label}
+                    currency={currency}
+                    format={format}
+                  />
+                </div>
               )}
 
-              <Card className="animate-step-in">
-                <CardHeader>
-                  <CardTitle className="text-lg">categories</CardTitle>
-                  <CardDescription>spend by category · {label}</CardDescription>
-                </CardHeader>
-                <CardContent>
-                  {loading || summary === null ? (
-                    <div className="flex h-72 items-center justify-center font-mono text-sm text-muted-foreground">
-                      loading…
-                    </div>
-                  ) : (
-                    <CategoryDonut slices={slices} format={format} />
-                  )}
-                </CardContent>
-              </Card>
-            </div>
+              <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+                {view === "year" ? (
+                  <Card className="animate-step-in">
+                    <CardHeader>
+                      <CardTitle className="text-lg">yearly spend</CardTitle>
+                      <CardDescription>
+                        {currency} · totals per year + cumulative {year ?? "…"}
+                      </CardDescription>
+                    </CardHeader>
+                    <CardContent className="flex flex-col gap-5">
+                      {loading || year === null || yearData === null ? (
+                        <div className="flex h-72 items-center justify-center font-mono text-sm text-muted-foreground">
+                          loading…
+                        </div>
+                      ) : (
+                        <>
+                          <div>
+                            <ChartLabel>total per year</ChartLabel>
+                            <YearlySpendChart
+                              year={year}
+                              points={yearData.yearly}
+                              format={format}
+                              compact={compact}
+                              onPin={pinSelection}
+                            />
+                          </div>
+                          <div>
+                            <ChartLabel>cumulative spend · {year}</ChartLabel>
+                            <CumulativeChart
+                              year={year}
+                              points={yearData.cumulative}
+                              format={format}
+                              compact={compact}
+                              onPin={pinSelection}
+                            />
+                          </div>
+                        </>
+                      )}
+                    </CardContent>
+                  </Card>
+                ) : (
+                  <Card className="animate-step-in">
+                    <CardHeader className="flex-row items-start justify-between gap-4">
+                      <div className="flex flex-col gap-1.5">
+                        <CardTitle className="text-lg">
+                          {granularity === "day" ? "daily spend" : "monthly spend"}
+                        </CardTitle>
+                        <CardDescription>
+                          {currency} · {label}
+                        </CardDescription>
+                      </div>
+                      <Segmented
+                        compact
+                        options={[
+                          { value: "month", label: "month" },
+                          { value: "day", label: "day" },
+                        ]}
+                        value={granularity}
+                        onChange={setGranularity}
+                      />
+                    </CardHeader>
+                    <CardContent>
+                      {loading || year === null || month === null || monthData === null ? (
+                        <div className="flex h-72 items-center justify-center font-mono text-sm text-muted-foreground">
+                          loading…
+                        </div>
+                      ) : granularity === "month" ? (
+                        <MonthlySpendChart
+                          year={year}
+                          months={monthData.months}
+                          selectedMonth={month}
+                          format={format}
+                          compact={compact}
+                          onPin={pinSelection}
+                        />
+                      ) : (
+                        <DailySpendChart
+                          year={year}
+                          month={month}
+                          days={monthData.days}
+                          format={format}
+                          compact={compact}
+                          onPin={pinSelection}
+                        />
+                      )}
+                    </CardContent>
+                  </Card>
+                )}
 
-            {current !== null && fxReady && year !== null && (
-              <TransactionsTable
-                key={year}
-                year={year}
-                categories={taxonomy}
-                format={format}
-                onOverride={() => setOverrideKey((key) => key + 1)}
-              />
-            )}
-          </div>
-        </main>
-      )}
+                <Card className="animate-step-in">
+                  <CardHeader>
+                    <CardTitle className="text-lg">categories</CardTitle>
+                    <CardDescription>spend by category · {label}</CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    {loading || summary === null ? (
+                      <div className="flex h-72 items-center justify-center font-mono text-sm text-muted-foreground">
+                        loading…
+                      </div>
+                    ) : (
+                      <CategoryDonut
+                        slices={slices}
+                        format={format}
+                        onPin={pinSelection}
+                        year={year}
+                        month={month}
+                      />
+                    )}
+                  </CardContent>
+                </Card>
+              </div>
+
+              {current !== null && fxReady && year !== null && (
+                <TransactionsTable
+                  key={year}
+                  year={year}
+                  categories={taxonomy}
+                  format={format}
+                  onOverride={() => setOverrideKey((key) => key + 1)}
+                />
+              )}
+            </div>
+          </main>
+        )}
+        <ChatSidebar
+          selections={selections}
+          onUnpin={unpinSelection}
+          onClearSelections={() => setSelections([])}
+          format={format}
+        />
+      </div>
 
       <footer className="border-t-2 border-border px-6 py-3">
         <div className="mx-auto flex w-full max-w-5xl items-center justify-between text-xs text-muted-foreground">

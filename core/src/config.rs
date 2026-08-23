@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+pub const GEMINI_API_BASE: &str = "https://geminiapi.googleapis.com/v1beta";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LlmProvider {
     Local,
@@ -32,6 +34,7 @@ pub struct Config {
     pub llm_model: String,
     pub gemini_api_key: Option<String>,
     pub gemini_model: String,
+    pub gemini_base_url: String,
     pub fx_base_url: String,
 }
 
@@ -56,6 +59,9 @@ impl Config {
             llm_model: get("LLM_MODEL").unwrap_or_default(),
             gemini_api_key: get("GEMINI_API_KEY"),
             gemini_model: get("GEMINI_MODEL").unwrap_or_else(|| "gemini-3.5-flash".to_string()),
+            gemini_base_url: get("GEMINI_BASE_URL")
+                .map(|v| v.trim_end_matches('/').to_string())
+                .unwrap_or_else(|| GEMINI_API_BASE.to_string()),
             fx_base_url: get("FX_BASE_URL")
                 .unwrap_or_else(|| "https://api.frankfurter.dev".to_string()),
         })
@@ -101,6 +107,7 @@ mod tests {
             llm_model: llm_model.into(),
             gemini_api_key: None,
             gemini_model: gemini_model.into(),
+            gemini_base_url: GEMINI_API_BASE.into(),
             fx_base_url: "https://api.frankfurter.dev".into(),
         }
     }
