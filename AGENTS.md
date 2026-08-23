@@ -20,12 +20,15 @@ KPIs, 12-month spend chart, category donut, year picker).
 ```
 core/        spend-core crate, shared by ingest and api
   src/schema.rs    DDL + seeds (accounts, 18-category taxonomy) + migrations
-  src/db.rs        ingest_connection (read-write, migrates) / api_connection (read-only)
+  src/db.rs        ingest_connection (read-write, migrates) / api_connection
+                   (read-only) / api_write_connection (short-lived read-write
+                   for inline overrides, drops + releases the lock)
   src/config.rs    .env loading, LLM provider selection
   src/fx.rs        Frankfurter client: cached_rate (fx_rates table) + monthly average
   src/llm.rs       OpenAI-compatible chat client (local llama-server or Gemini)
   src/queries.rs   Read-only year-scoped queries: summary, monthly_spend,
-                   category_breakdown, meta
+                   category_breakdown, meta, list_transactions/get_transaction;
+                   set_transaction + kind_for_transfer for inline overrides
 ingest/      `spend` CLI (cargo run -p ingest -- ingest <paths>)
   src/detect.rs    Source detection from ancestor dir name, recursive CSV collection
   src/neon.rs      Semicolon CSV parser (BOM, quoted fields, multiline subjects)
@@ -33,10 +36,12 @@ ingest/      `spend` CLI (cargo run -p ingest -- ingest <paths>)
   src/categorize.rs  Shared LLM categorization: 60-row batches, taxonomy validation,
                    llm_calls audit rows
 api/         Axum server on 127.0.0.1:3000
-  src/main.rs      /api/meta, /api/summary, /api/series/monthly, /api/categories
-                   (all take ?year=); serves frontend/dist as an SPA fallback
-frontend/    Vite app; src/App.tsx is the whole dashboard (KPI cards, Recharts
-             bar + donut, year picker); src/components/ui = shadcn primitives
+  src/main.rs      /api/meta, /api/summary, /api/series/*, /api/categories
+                   (all take ?year=), /api/transactions (GET list + PATCH
+                   override); serves frontend/dist as an SPA fallback
+frontend/    Vite app; src/App.tsx is the dashboard (KPI cards, Recharts bar +
+             donut, year picker); src/components/TransactionsTable.tsx =
+             inline-override table; src/components/ui = shadcn primitives
 statements/  CSV exports, one subdirectory per source (Neon/, Revolut/,
              cashback_cards/); source is detected from that directory name
 data/        spend.duckdb lives here (gitignored, created on first run)
@@ -74,12 +79,20 @@ data/        spend.duckdb lives here (gitignored, created on first run)
   rows are upserted by natural key; rows without a category go through
   `categorize.rs` in batches and must map back to a valid taxonomy entry
   (invalid batches fail the run).
-- **DB access split**: only the `ingest` process opens DuckDB read-write and
-  runs migrations. The API opens the same file read-only (bootstrapping the
-  schema once on a fresh checkout) and runs all queries on blocking threads.
+- **DB access split**: the `ingest` process owns read-write + migrations. The
+  API opens the same file read-only per request (bootstrapping the schema once
+  on a fresh checkout) and runs reads on blocking threads. The single exception
+  is `PATCH /api/transactions/{id}`, which opens a short-lived read-write
+  connection (`api_write_connection`), writes, and drops it before returning so
+  the file lock is released and `spend ingest` can still run while the API is
+  idle.
 - **Dashboard data flow**: frontend fetches `/api/meta` (accounts, categories,
   available year periods) plus `/api/summary`, `/api/series/monthly`,
   `/api/categories` with `?year=`; the year picker refetches on change.
+  The transactions table fetches `/api/transactions?year=...` (optional
+  source/category/month filters + paging) and edits rows via
+  `PATCH /api/transactions/{id}` (category and/or `is_transfer`), refetching
+  the KPIs/charts after each override.
   Missing/invalid `year` -> 400.
 
 ## End-to-end testing
