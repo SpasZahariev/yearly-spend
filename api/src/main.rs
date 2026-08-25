@@ -33,6 +33,7 @@ fn app(state: AppState) -> Router {
         .route("/api/series/yearly", get(yearly_series))
         .route("/api/series/cumulative", get(cumulative_series))
         .route("/api/series/daily", get(daily_series))
+        .route("/api/series/sankey", get(sankey_series))
         .route("/api/categories", get(categories))
         .route("/api/transactions", get(list_transactions))
         .route("/api/transactions/{id}", patch(patch_transaction))
@@ -130,6 +131,20 @@ async fn daily_series(state: State<Arc<AppState>>, query: Query<MonthQuery>) -> 
     run_query(state, move |conn| {
         let days = spend_core::queries::daily_spend(conn, year, month)?;
         Ok(serde_json::to_value(days)?)
+    })
+    .await
+}
+
+async fn sankey_series(state: State<Arc<AppState>>, query: Query<PeriodQuery>) -> Response {
+    if let Some(month) = query.month
+        && !valid_month(month)
+    {
+        return (StatusCode::BAD_REQUEST, "month must be between 1 and 12").into_response();
+    }
+    let year = query.year;
+    run_query(state, move |conn| {
+        let data = spend_core::queries::sankey(conn, year, query.month)?;
+        Ok(serde_json::to_value(data)?)
     })
     .await
 }

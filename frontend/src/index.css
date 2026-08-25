@@ -1,40 +1,42 @@
-@import "@fontsource/pixelify-sans/700.css";
 @import "@fontsource/inter/400.css";
 @import "@fontsource/inter/500.css";
 @import "@fontsource/inter/600.css";
 @import "tailwindcss";
 
 :root {
-  --background: oklch(1 0 0);
-  --foreground: oklch(0.21 0 0);
-  --card: oklch(1 0 0);
-  --card-foreground: oklch(0.21 0 0);
-  --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.21 0 0);
-  --primary: oklch(0.21 0 0);
-  --primary-foreground: oklch(1 0 0);
-  --secondary: oklch(0.965 0 0);
-  --secondary-foreground: oklch(0.21 0 0);
-  --muted: oklch(0.965 0 0);
-  --muted-foreground: oklch(0.48 0 0);
-  --accent: oklch(0.965 0 0);
-  --accent-foreground: oklch(0.21 0 0);
-  --destructive: oklch(0.577 0.245 27.325);
-  --destructive-foreground: oklch(1 0 0);
-  --border: oklch(0.21 0 0);
-  --input: oklch(0.21 0 0);
-  --ring: oklch(0.21 0 0);
-  --chart-1: oklch(0.21 0 0);
-  --chart-2: oklch(0.45 0 0);
-  --chart-3: oklch(0.6 0 0);
-  --chart-4: oklch(0.75 0 0);
-  --chart-5: oklch(0.88 0 0);
+  --background: #f9f9f9;
+  --foreground: #000000;
+  --card: #ffffff;
+  --card-foreground: #000000;
+  --popover: #ffffff;
+  --popover-foreground: #000000;
+  --primary: #000000;
+  --primary-foreground: #ffffff;
+  --secondary: #f1f1f1;
+  --secondary-foreground: #000000;
+  --muted: #f1f1f1;
+  --muted-foreground: #6d6d6d;
+  --accent: #fff0fa;
+  --accent-foreground: #000000;
+  --destructive: #e5484d;
+  --destructive-foreground: #ffffff;
+  --border: #e7e7e7;
+  --input: #bdbdbd;
+  --ring: #f50db4;
+  --chart-1: #f50db4;
+  --chart-2: #ff9cdb;
+  --chart-3: #ffc5e9;
+  --chart-4: #dedede;
+  --chart-5: #a8a8a8;
+  --brand-pink: #f50db4;
+  --brand-pink-muted: color-mix(in srgb, var(--brand-pink) 70%, transparent);
   --radius: 0px;
 }
 
 @theme inline {
   --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
-  --font-pixel: "Pixelify Sans", ui-monospace, monospace;
+  --font-mono: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Inter", ui-sans-serif, system-ui, sans-serif;
   --color-background: var(--background);
   --color-foreground: var(--foreground);
   --color-card: var(--card);
@@ -59,6 +61,8 @@
   --color-chart-3: var(--chart-3);
   --color-chart-4: var(--chart-4);
   --color-chart-5: var(--chart-5);
+  --color-brand-pink: var(--brand-pink);
+  --color-brand-pink-muted: var(--brand-pink-muted);
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
   --radius-lg: var(--radius);
@@ -105,39 +109,140 @@
     @apply border-border outline-ring/50;
   }
 
+  html {
+    background: var(--background);
+  }
+
   body {
     @apply bg-background font-sans text-foreground antialiased;
+    min-width: 320px;
+    text-rendering: optimizeLegibility;
+  }
+
+  * {
+    scrollbar-color: var(--brand-pink) var(--background);
+    scrollbar-width: thin;
+  }
+
+  *::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  *::-webkit-scrollbar-track {
+    background: var(--background);
+    border-left: 1px solid var(--border);
+  }
+
+  *::-webkit-scrollbar-button {
+    display: block;
+    width: 10px;
+    height: 10px;
+    background: #ffffff;
+    color: #ffffff;
+    border: 0;
+  }
+
+  *::-webkit-scrollbar-thumb {
+    background: var(--brand-pink);
+    border: 2px solid var(--background);
+  }
+
+  *::-webkit-scrollbar-thumb:hover {
+    background: var(--foreground);
+  }
+
+  *::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+
+  button,
+  input,
+  select,
+  textarea {
+    font: inherit;
   }
 }
 
-/* Hard-edged 14px dither band (7px checkerboard squares over a 14px strip). */
 @utility dither-band {
-  height: 14px;
-  border-top: 2px solid var(--border);
-  border-bottom: 2px solid var(--border);
-  background-image: conic-gradient(
-    var(--foreground) 0 25%,
-    transparent 0 50%,
-    var(--foreground) 0 75%,
-    transparent 0 100%
-  );
-  background-size: 14px 14px;
-  image-rendering: pixelated;
+  height: 1px;
+  background: var(--border);
 }
 
-/* Pixel-row overlay: subtle horizontal 4px scanlines for textured sections. */
 @utility pixel-rows {
   position: relative;
 
   &::after {
-    content: "";
-    position: absolute;
-    inset: 0;
-    pointer-events: none;
-    background-image: repeating-linear-gradient(
-      to bottom,
-      transparent 0 3px,
-      color-mix(in oklab, var(--foreground) 5%, transparent) 3px 4px
-    );
+    display: none;
   }
+}
+
+@utility app-frame {
+  min-height: calc(100dvh - 2rem);
+  margin: 1rem;
+  border: 1px solid var(--border);
+  background: var(--background);
+
+  @media (min-width: 1024px) {
+    height: calc(100dvh - 2rem);
+  }
+
+  background-image:
+    linear-gradient(
+      to right,
+      color-mix(in srgb, var(--border) 62%, transparent) 1px,
+      transparent 1px
+    ),
+    linear-gradient(
+      to bottom,
+      color-mix(in srgb, var(--border) 62%, transparent) 1px,
+      transparent 1px
+    );
+  background-size: 48px 48px;
+}
+
+@utility brand-mark {
+  display: inline-flex;
+  width: 2rem;
+  height: 2rem;
+  align-items: center;
+  justify-content: center;
+  background: var(--brand-pink);
+  color: #ffffff;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: -0.04em;
+}
+
+@utility text-band {
+  display: inline-flex;
+  min-height: 1.35rem;
+  align-items: center;
+  padding: 0.08em 0.18em 0.12em;
+  background: var(--brand-pink-muted);
+  color: #000000;
+  line-height: 1;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+
+@utility text-tag {
+  display: inline-flex;
+  align-self: stretch;
+  align-items: center;
+  background: var(--foreground);
+  color: var(--background);
+  padding: 0.25rem 0.45rem;
+  font-size: 0.625rem;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0.04em;
+}
+
+@utility text-tag-offset {
+  align-self: flex-start;
+  min-height: 0;
+  margin-top: 15px;
+  padding-top: 0.2rem;
+  padding-bottom: 0.2rem;
 }

@@ -1,7 +1,7 @@
 // Data shapes shared by the dashboard (App) and the transactions table.
 
 /** Which chart a pinned selection chip came from (mirrors the API enum). */
-export type ChartKind = "yearly" | "cumulative" | "monthly" | "daily" | "categories"
+export type ChartKind = "yearly" | "cumulative" | "monthly" | "daily" | "categories" | "sankey"
 
 /**
  * A pinned chart selection (bar, slice or point) sent with every chat

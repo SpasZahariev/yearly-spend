@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react"
+import { EditorialTitle } from "@/components/EditorialTitle"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { Card, CardContent, CardDescription, CardHeader } from "@/components/ui/card"
 import { getJson, patchJson } from "@/lib/api"
 import { cn } from "@/lib/utils"
 import type { Category, Transaction, TransactionsResponse } from "@/types"
@@ -36,8 +37,8 @@ const MONTH_OPTIONS = [
 ]
 
 function amountClass(kind: string) {
-  if (kind === "income") return "text-emerald-600"
-  if (kind === "spend") return "text-rose-600"
+  if (kind === "income") return "text-green-600"
+  if (kind === "spend") return "text-brand-pink"
   return "text-muted-foreground"
 }
 
@@ -45,16 +46,9 @@ interface TransactionsTableProps {
   year: number
   categories: Category[]
   format: (value: number) => string
-  /** Called after a successful override so the dashboard refetches its KPIs/charts. */
-  onOverride: () => void
 }
 
-export function TransactionsTable({
-  year,
-  categories,
-  format,
-  onOverride,
-}: TransactionsTableProps) {
+export function TransactionsTable({ year, categories, format }: TransactionsTableProps) {
   const [source, setSource] = useState("all")
   const [category, setCategory] = useState("all")
   const [month, setMonth] = useState("all")
@@ -97,7 +91,6 @@ export function TransactionsTable({
             ? { ...prev, items: prev.items.map((it) => (it.id === updated.id ? updated : it)) }
             : prev,
         )
-        onOverride()
       })
       .catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)))
       .finally(() =>
@@ -115,9 +108,9 @@ export function TransactionsTable({
 
   return (
     <Card className="animate-step-in">
-      <CardHeader className="flex-row items-start justify-between gap-4">
+      <CardHeader className="flex-row items-start justify-between gap-4 border-b border-border">
         <div className="flex flex-col gap-1.5">
-          <CardTitle className="text-lg">transactions</CardTitle>
+          <EditorialTitle title="transactions" tag={String(year)} />
           <CardDescription>
             inline overrides · {year} · {total} rows
           </CardDescription>
@@ -165,7 +158,7 @@ export function TransactionsTable({
           <div className="overflow-x-auto">
             <table className="w-full border-collapse text-sm">
               <thead>
-                <tr className="border-b-2 border-border text-left font-mono text-[11px] uppercase tracking-widest text-muted-foreground">
+                <tr className="border-b border-border text-left text-[11px] font-medium uppercase tracking-[0.12em] text-muted-foreground">
                   <th className="py-2 pr-3 font-medium">date</th>
                   <th className="py-2 pr-3 font-medium">description</th>
                   <th className="py-2 pr-3 font-medium">source</th>
@@ -178,7 +171,7 @@ export function TransactionsTable({
                 {items.map((tx) => {
                   const busy = saving.has(tx.id)
                   return (
-                    <tr key={tx.id} className="border-b border-border align-top hover:bg-accent/40">
+                    <tr key={tx.id} className="border-b border-border align-top hover:bg-accent/60">
                       <td className="whitespace-nowrap py-2 pr-3 font-mono text-xs text-foreground">
                         {tx.dt}
                       </td>
@@ -211,7 +204,7 @@ export function TransactionsTable({
                         <div className="flex items-center gap-2">
                           <span
                             aria-hidden="true"
-                            className="size-3 shrink-0 border-2 border-border"
+                            className="size-3 shrink-0 border border-border"
                             style={{ backgroundColor: tx.category?.color ?? "var(--muted)" }}
                           />
                           <select
@@ -219,7 +212,7 @@ export function TransactionsTable({
                             value={tx.category?.name ?? "uncategorized"}
                             disabled={busy}
                             onChange={(event) => override(tx, { category: event.target.value })}
-                            className="h-8 rounded-none border-2 border-input bg-background px-1.5 font-mono text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
+                            className="h-8 rounded-none border border-input bg-background px-1.5 text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
                           >
                             {categories.map((option) => (
                               <option key={option.name} value={option.name}>
@@ -236,7 +229,7 @@ export function TransactionsTable({
                           checked={tx.is_transfer}
                           disabled={busy}
                           onChange={(event) => override(tx, { is_transfer: event.target.checked })}
-                          className="size-4 accent-[var(--foreground)] disabled:opacity-50"
+                          className="size-4 accent-[var(--brand-pink)] disabled:opacity-50"
                           aria-label={`mark ${tx.description} as transfer`}
                         />
                       </td>
@@ -248,7 +241,7 @@ export function TransactionsTable({
           </div>
         )}
 
-        <div className="mt-4 flex items-center justify-between font-mono text-xs text-muted-foreground">
+        <div className="mt-4 flex items-center justify-between text-xs text-muted-foreground">
           <span>
             page {data?.page ?? 0} / {pages} · {total} rows
           </span>
@@ -301,7 +294,7 @@ function FilterSelect({
       name={name}
       value={value}
       onChange={(event) => onChange(event.target.value)}
-      className="h-8 rounded-none border-2 border-input bg-background px-1.5 font-mono text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      className="h-8 rounded-none border border-input bg-background px-1.5 text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
     >
       {options.map((option) => (
         <option key={option.value} value={option.value}>

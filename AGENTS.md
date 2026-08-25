@@ -44,12 +44,16 @@ api/         Axum server on 127.0.0.1:3000
                    (all take ?year=), /api/transactions (GET list + PATCH
                    override), /api/chat (POST, SSE); serves frontend/dist as an
                    SPA fallback
-frontend/    Vite app; src/App.tsx is the dashboard (KPI cards, Recharts bar +
-             donut, year picker, chart-click pinning); src/components/
-             TransactionsTable.tsx = inline-override table; src/components/
-             ChatSidebar.tsx = inspector chat (chips, streaming items);
-             src/lib/chat.ts = fetch+ReadableStream SSE client; src/components/ui
-             = shadcn primitives
+frontend/    Vite app; src/App.tsx = shell with dependency-free hash routing
+             (#/ dashboard, #/transactions transactions) and shared state
+             (meta/years, currency + FX, chat pins); src/pages/Dashboard.tsx =
+             KPI cards + Recharts bar/donut + chart-click pinning;
+             src/pages/Transactions.tsx = inline-override table page
+             (components/TransactionsTable.tsx); src/components/ChatSidebar.tsx
+             = inspector chat (chips, streaming items, dashboard page only);
+             src/lib/format.ts = currency/period formatters; src/lib/chat.ts =
+             fetch+ReadableStream SSE client; src/components/ui = shadcn
+             primitives
 statements/  CSV exports, one subdirectory per source (Neon/, Revolut/,
              cashback_cards/); source is detected from that directory name
 data/        spend.duckdb lives here (gitignored, created on first run)
@@ -75,7 +79,8 @@ data/        spend.duckdb lives here (gitignored, created on first run)
 - **idempotency**: two layers - whole-file skip by SHA in `ingested_files`
   (skipped before parsing), plus natural-key upserts for rows.
 - **pixel app**: the frontend design system - 2px borders, square corners,
-  pixel font, dither band; Recharts animations disabled.
+  Space Grotesk display font (`font-display`), dither band; Recharts
+  animations disabled.
 - **just**: the justfile task runner (`just setup`, `just serve`, `just check`).
 
 ## How the important components work
@@ -97,10 +102,11 @@ data/        spend.duckdb lives here (gitignored, created on first run)
 - **Dashboard data flow**: frontend fetches `/api/meta` (accounts, categories,
   available year periods) plus `/api/summary`, `/api/series/monthly`,
   `/api/categories` with `?year=`; the year picker refetches on change.
-  The transactions table fetches `/api/transactions?year=...` (optional
+  Pages unmount on hash-route change, so the dashboard refetches whenever
+  you return to it (overrides made on the transactions page show up then).
+  The transactions page fetches `/api/transactions?year=...` (optional
   source/category/month filters + paging) and edits rows via
-  `PATCH /api/transactions/{id}` (category and/or `is_transfer`), refetching
-  the KPIs/charts after each override.
+  `PATCH /api/transactions/{id}` (category and/or `is_transfer`).
   Missing/invalid `year` -> 400.
 - **Chat**: clicking any chart element pins a selection chip (chart, series,
   label, value, year) in the right-side inspector; chips live in per-tab React

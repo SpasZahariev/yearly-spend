@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{Datelike, NaiveDate};
 use duckdb::Connection;
@@ -73,6 +73,32 @@ pub struct CategorySlice {
     pub color: String,
     pub value: f64,
     pub percentage: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SankeyNode {
+    pub id: String,
+    pub label: String,
+    pub color: String,
+    pub column: u8,
+    pub value: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SankeyLink {
+    pub source: String,
+    pub target: String,
+    pub value: f64,
+    pub color: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SankeyData {
+    pub year: i32,
+    pub month: Option<u32>,
+    pub nodes: Vec<SankeyNode>,
+    pub links: Vec<SankeyLink>,
 }
 
 fn cents(value: f64) -> f64 {
@@ -248,6 +274,175 @@ pub fn category_breakdown(
             }
         })
         .collect())
+}
+
+/// Spend flows from accounts to categories, plus paired transfers from one
+/// account to another. Accounts that receive paired transfers are placed
+/// downstream from their funding accounts. Internal bookkeeping rows and
+/// unpaired transfer legs are intentionally excluded because they do not
+/// identify a destination.
+pub fn sankey(conn: &Connection, year: i32, month: Option<u32>) -> anyhow::Result<SankeyData> {
+    let mut nodes = HashMap::<String, SankeyNode>::new();
+    let mut links = Vec::new();
+    let mut transfer_sources = HashSet::new();
+    let mut transfer_targets = HashSet::new();
+
+    let mut spend_stmt = conn.prepare(
+        "SELECT t.account_id,
+                a.name,
+                COALESCE(c.name, 'uncategorized') AS category,
+                COALESCE(c.color, '#78716c') AS color,
+                sum(-t.amount_chf) AS value
+         FROM transactions t
+         JOIN accounts a ON a.id = t.account_id
+         LEFT JOIN categories c ON c.id = t.category_id
+         WHERE t.kind = 'spend'
+           AND year(t.dt) = ?
+           AND (? IS NULL OR month(t.dt) = ?)
+         GROUP BY 1, 2, 3, 4
+         HAVING sum(-t.amount_chf) > 0
+         ORDER BY 5 DESC",
+    )?;
+    let spend_rows: Vec<(i64, String, String, String, f64)> = spend_stmt
+        .query_map(duckdb::params![year, month, month], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?
+        .collect::<duckdb::Result<Vec<_>>>()?;
+
+    for (account_id, account_name, category_name, category_color, value) in spend_rows {
+        let source = format!("account:{account_id}");
+        let target = format!("category:{category_name}");
+        add_sankey_node(
+            &mut nodes,
+            &source,
+            &account_name,
+            account_color(account_id),
+            0,
+        );
+        add_sankey_node(&mut nodes, &target, &category_name, &category_color, 2);
+        links.push(SankeyLink {
+            source,
+            target,
+            value: cents(value),
+            color: category_color,
+            kind: "spend".into(),
+        });
+    }
+
+    let mut transfer_stmt = conn.prepare(
+        "SELECT g.from_account_id,
+                from_account.name,
+                g.to_account_id,
+                to_account.name,
+                sum(g.amount_chf) AS value
+         FROM transfer_groups g
+         JOIN accounts from_account ON from_account.id = g.from_account_id
+         JOIN accounts to_account ON to_account.id = g.to_account_id
+         WHERE year(g.dt) = ?
+           AND (? IS NULL OR month(g.dt) = ?)
+         GROUP BY 1, 2, 3, 4
+         HAVING sum(g.amount_chf) > 0
+         ORDER BY 5 DESC",
+    )?;
+    let transfer_rows: Vec<(i64, String, i64, String, f64)> = transfer_stmt
+        .query_map(duckdb::params![year, month, month], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?
+        .collect::<duckdb::Result<Vec<_>>>()?;
+
+    for (from_id, from_name, to_id, to_name, value) in transfer_rows {
+        let source = format!("account:{from_id}");
+        let target = format!("account:{to_id}");
+        add_sankey_node(&mut nodes, &source, &from_name, account_color(from_id), 0);
+        add_sankey_node(&mut nodes, &target, &to_name, account_color(to_id), 1);
+        transfer_sources.insert(from_id);
+        transfer_targets.insert(to_id);
+        links.push(SankeyLink {
+            source,
+            target,
+            value: cents(value),
+            color: "#94a3b8".into(),
+            kind: "transfer".into(),
+        });
+    }
+
+    for (account_id, node) in nodes.iter_mut().filter_map(|(id, node)| {
+        id.strip_prefix("account:")
+            .and_then(|value| value.parse::<i64>().ok())
+            .map(|account_id| (account_id, node))
+    }) {
+        node.column =
+            if transfer_targets.contains(&account_id) && !transfer_sources.contains(&account_id) {
+                1
+            } else {
+                0
+            };
+    }
+
+    let mut nodes: Vec<SankeyNode> = nodes.into_values().collect();
+    for node in &mut nodes {
+        let incoming = links
+            .iter()
+            .filter(|link| link.target == node.id)
+            .map(|link| link.value)
+            .sum::<f64>();
+        let outgoing = links
+            .iter()
+            .filter(|link| link.source == node.id)
+            .map(|link| link.value)
+            .sum::<f64>();
+        node.value = cents(incoming.max(outgoing));
+    }
+    nodes.sort_by(|a, b| {
+        a.column
+            .cmp(&b.column)
+            .then_with(|| b.value.total_cmp(&a.value))
+            .then_with(|| a.label.cmp(&b.label))
+    });
+
+    Ok(SankeyData {
+        year,
+        month,
+        nodes,
+        links,
+    })
+}
+
+fn add_sankey_node(
+    nodes: &mut HashMap<String, SankeyNode>,
+    id: &str,
+    label: &str,
+    color: &str,
+    column: u8,
+) {
+    nodes.entry(id.to_string()).or_insert_with(|| SankeyNode {
+        id: id.to_string(),
+        label: label.to_string(),
+        color: color.to_string(),
+        column,
+        value: 0.0,
+    });
+}
+
+fn account_color(id: i64) -> &'static str {
+    match id {
+        1 => "#f50db4",
+        2 => "#111111",
+        3 => "#0ea5e9",
+        _ => "#8b5cf6",
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -652,6 +847,51 @@ mod tests {
             vec![("travel", 250.5, 100.0),]
         );
         assert!(category_breakdown(&conn, 2025, Some(3)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn sankey_returns_category_spend_and_paired_account_transfers() {
+        let conn = seeded();
+        insert_sample(&conn);
+        conn.execute(
+            "INSERT INTO transfer_groups (from_account_id, to_account_id, amount_chf, dt)
+             VALUES (1, 2, 50.0, '2025-01-30')",
+            [],
+        )
+        .unwrap();
+
+        let got = sankey(&conn, 2025, None).unwrap();
+        assert_eq!(got.year, 2025);
+        assert_eq!(got.month, None);
+        assert_eq!(got.links.len(), 3);
+        assert_eq!(
+            got.links
+                .iter()
+                .map(|link| (
+                    link.source.as_str(),
+                    link.target.as_str(),
+                    link.value,
+                    link.kind.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("account:1", "category:travel", 250.5, "spend"),
+                ("account:1", "category:food", 175.25, "spend"),
+                ("account:1", "account:2", 50.0, "transfer"),
+            ]
+        );
+        assert_eq!(
+            got.nodes
+                .iter()
+                .map(|node| (node.id.as_str(), node.column, node.value))
+                .collect::<Vec<_>>(),
+            vec![
+                ("account:1", 0, 475.75),
+                ("account:2", 1, 50.0),
+                ("category:travel", 2, 250.5),
+                ("category:food", 2, 175.25),
+            ]
+        );
     }
 
     #[test]
