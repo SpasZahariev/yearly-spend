@@ -358,8 +358,8 @@ async fn fx_spot(state: State<Arc<AppState>>, query: Query<FxQuery>) -> Response
     }
 }
 
-/// Body for `POST /api/chat`. `message` is required; up to a few pinned
-/// chart selections may travel with it as context.
+/// Body for `POST /api/chat`. `message` is required; pinned chart selections
+/// may travel with it as context.
 #[derive(Debug, Deserialize)]
 struct ChatBody {
     message: String,
@@ -368,7 +368,6 @@ struct ChatBody {
 }
 
 const MAX_MESSAGE_CHARS: usize = 20_000;
-const MAX_SELECTIONS: usize = 10;
 
 /// `POST /api/chat`: streams the assistant reply as SSE. Event kinds:
 /// default (`data: <token>`), `tool` (`data: {"sql": ...}`) and `error`
@@ -381,9 +380,6 @@ async fn chat(state: State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Respon
             format!("message must be 1..{MAX_MESSAGE_CHARS} chars"),
         )
             .into_response();
-    }
-    if body.selections.len() > MAX_SELECTIONS {
-        return (StatusCode::BAD_REQUEST, "too many selections").into_response();
     }
     for selection in &body.selections {
         if let Err(err) = selection.validate() {
@@ -1522,7 +1518,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "body: {sse}");
-        // Too many selections -> 400.
+        // Multiple selections from the same chart are accepted.
         let selections: Vec<serde_json::Value> = (0..11)
             .map(|i| {
                 serde_json::json!({
@@ -1538,7 +1534,7 @@ mod tests {
             &serde_json::json!({ "message": "hi", "selections": selections }),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {sse}");
+        assert_eq!(status, StatusCode::OK, "body: {sse}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

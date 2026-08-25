@@ -2,13 +2,12 @@ import { useEffect, useRef, useState } from "react"
 import { Button } from "@/components/ui/button"
 import { streamChat } from "@/lib/chat"
 import { cn } from "@/lib/utils"
-import type { Selection } from "@/types"
+import { selectionKey, type Selection } from "@/types"
 
 const STARTER_PROMPTS = [
   "What was my biggest spending category this year?",
   "Which account spent the most this year?",
   "How much did I move between accounts?",
-  "What were my three most expensive months?",
 ]
 
 type ChatItem =
@@ -168,13 +167,14 @@ export function ChatSidebar({
     >
       {selections.length > 0 && (
         <div className="flex items-center justify-end gap-2 border-b border-border px-4 py-3">
-          <button
+          <Button
             type="button"
             onClick={onClearSelections}
-            className="text-[11px] font-medium uppercase tracking-[0.12em] text-muted-foreground hover:text-foreground"
+            size="sm"
+            className="border border-brand-pink px-3 text-[11px] font-semibold uppercase tracking-[0.12em]"
           >
             clear pins
-          </button>
+          </Button>
         </div>
       )}
 
@@ -182,7 +182,7 @@ export function ChatSidebar({
         <div className="flex flex-wrap gap-1.5 border-b border-border px-3 py-2">
           {selections.map((selection) => (
             <SelectionChip
-              key={`${selection.chart}:${selection.label}`}
+              key={selectionKey(selection)}
               selection={selection}
               onUnpin={onUnpin}
               format={format}
@@ -208,7 +208,7 @@ export function ChatSidebar({
                   type="button"
                   disabled={busy}
                   onClick={() => void send(prompt)}
-                  className="border border-foreground bg-foreground px-3 py-2 text-left text-xs leading-relaxed text-background transition-opacity hover:opacity-80 disabled:pointer-events-none disabled:opacity-50"
+                  className="border border-foreground bg-foreground px-3 py-2 text-left text-base leading-relaxed text-background transition-opacity hover:opacity-80 disabled:pointer-events-none disabled:opacity-50"
                 >
                   {prompt}
                 </button>

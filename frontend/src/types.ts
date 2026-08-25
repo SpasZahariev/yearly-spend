@@ -18,6 +18,17 @@ export interface Selection {
   category?: string
 }
 
+export function selectionKey(selection: Selection) {
+  return [
+    selection.chart,
+    selection.series,
+    selection.label,
+    selection.year ?? "",
+    selection.month ?? "",
+    selection.category ?? "",
+  ].join(":")
+}
+
 export interface Category {
   id: number
   name: string
