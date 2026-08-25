@@ -110,7 +110,7 @@ function KpiCard({
   format: (value: number) => string
 }) {
   return (
-    <Card className="animate-step-in border-t-2 border-t-brand-pink">
+    <Card className="animate-step-in border-l-2 border-l-brand-pink">
       <CardContent className="p-6">
         <div className="inline-flex items-stretch gap-0">
           <span className="text-band text-xs font-semibold uppercase tracking-[0.08em]">

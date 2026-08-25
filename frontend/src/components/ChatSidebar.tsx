@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react"
+import { useEffect, useRef, useState, type ReactNode } from "react"
 import { Button } from "@/components/ui/button"
 import { streamChat } from "@/lib/chat"
 import { cn } from "@/lib/utils"
@@ -56,6 +56,325 @@ function SqlChip({ sql }: { sql: string }) {
         run_sql
       </span>
       <code className="break-all text-muted-foreground">{sql}</code>
+    </div>
+  )
+}
+
+function safeHref(href: string) {
+  const value = href.trim()
+  return /^(https?:|mailto:)/i.test(value) ? value : null
+}
+
+function renderInline(text: string, keyPrefix: string): ReactNode[] {
+  const tokenPattern =
+    /`([^`\n]+)`|\[([^\]]+)\]\(([^)\s]+)(?:\s+["'][^)]*)?\)|\*\*([^*\n]+)\*\*|__([^_\n]+)__|~~([^~\n]+)~~|\*([^*\n]+)\*|_([^_\n]+)_|(https?:\/\/[^\s<]+)/g
+  const nodes: ReactNode[] = []
+  let cursor = 0
+  let match: RegExpExecArray | null
+  let tokenIndex = 0
+
+  while ((match = tokenPattern.exec(text)) !== null) {
+    if (match.index > cursor) {
+      nodes.push(text.slice(cursor, match.index))
+    }
+
+    if (match[1] !== undefined) {
+      nodes.push(
+        <code
+          key={`${keyPrefix}-code-${tokenIndex}`}
+          className="border border-border bg-muted px-1"
+        >
+          {match[1]}
+        </code>,
+      )
+    } else if (match[2] !== undefined && match[3] !== undefined) {
+      const href = safeHref(match[3])
+      nodes.push(
+        href === null ? (
+          <span key={`${keyPrefix}-link-${tokenIndex}`}>{match[2]}</span>
+        ) : (
+          <a
+            key={`${keyPrefix}-link-${tokenIndex}`}
+            href={href}
+            target="_blank"
+            rel="noreferrer"
+            className="text-brand-pink underline decoration-brand-pink underline-offset-2 hover:text-foreground"
+          >
+            {match[2]}
+          </a>
+        ),
+      )
+    } else if (match[4] !== undefined || match[5] !== undefined) {
+      nodes.push(
+        <strong key={`${keyPrefix}-strong-${tokenIndex}`}>
+          {renderInline(match[4] ?? match[5] ?? "", `${keyPrefix}-strong-${tokenIndex}`)}
+        </strong>,
+      )
+    } else if (match[6] !== undefined) {
+      nodes.push(
+        <del key={`${keyPrefix}-del-${tokenIndex}`}>
+          {renderInline(match[6], `${keyPrefix}-del-${tokenIndex}`)}
+        </del>,
+      )
+    } else if (match[7] !== undefined || match[8] !== undefined) {
+      nodes.push(
+        <em key={`${keyPrefix}-em-${tokenIndex}`}>
+          {renderInline(match[7] ?? match[8] ?? "", `${keyPrefix}-em-${tokenIndex}`)}
+        </em>,
+      )
+    } else if (match[9] !== undefined) {
+      const rawHref = match[9]
+      const href = rawHref.replace(/[),.!?;:]+$/, "")
+      const trailing = rawHref.slice(href.length)
+      nodes.push(
+        <a
+          key={`${keyPrefix}-url-${tokenIndex}`}
+          href={href}
+          target="_blank"
+          rel="noreferrer"
+          className="text-brand-pink underline decoration-brand-pink underline-offset-2 hover:text-foreground"
+        >
+          {href}
+        </a>,
+      )
+      if (trailing !== "") nodes.push(trailing)
+    }
+
+    cursor = match.index + match[0].length
+    tokenIndex += 1
+  }
+
+  if (cursor < text.length) nodes.push(text.slice(cursor))
+  return nodes
+}
+
+function tableCells(line: string) {
+  const trimmed = line.trim().replace(/^\|/, "").replace(/\|$/, "")
+  return trimmed.split("|").map((cell) => cell.trim())
+}
+
+function isTableDivider(line: string) {
+  return tableCells(line).every((cell) => /^:?-{3,}:?$/.test(cell))
+}
+
+function renderMarkdownBlocks(markdown: string, keyPrefix: string): ReactNode[] {
+  const lines = markdown.replace(/\r\n?/g, "\n").split("\n")
+  const blocks: ReactNode[] = []
+  let index = 0
+  let blockIndex = 0
+
+  while (index < lines.length) {
+    if (lines[index].trim() === "") {
+      index += 1
+      continue
+    }
+
+    const blockKey = `${keyPrefix}-${blockIndex}`
+    const fence = lines[index].match(/^ {0,3}(```+|~~~+)\s*(.*)$/)
+    if (fence !== null) {
+      const marker = fence[1][0]
+      const code: string[] = []
+      const language = fence[2].trim()
+      index += 1
+      while (index < lines.length && !new RegExp(`^ {0,3}${marker}{3,}\\s*$`).test(lines[index])) {
+        code.push(lines[index])
+        index += 1
+      }
+      if (index < lines.length) index += 1
+      blocks.push(
+        <pre
+          key={blockKey}
+          className="my-2 max-w-full overflow-x-auto border border-border bg-muted p-2 font-mono text-[11px] leading-relaxed"
+        >
+          <code className={language === "" ? undefined : `language-${language}`}>
+            {code.join("\n")}
+          </code>
+        </pre>,
+      )
+      blockIndex += 1
+      continue
+    }
+
+    const heading = lines[index].match(/^ {0,3}(#{1,6})\s+(.+?)\s*#*\s*$/)
+    if (heading !== null) {
+      const level = Math.min(heading[1].length, 4)
+      const Heading = `h${level}` as "h1" | "h2" | "h3" | "h4"
+      const headingClass =
+        level === 1
+          ? "mt-2 text-base font-semibold"
+          : level === 2
+            ? "mt-2 text-sm font-semibold"
+            : "mt-2 text-xs font-semibold uppercase tracking-[0.08em]"
+      blocks.push(
+        <Heading key={blockKey} className={headingClass}>
+          {renderInline(heading[2], blockKey)}
+        </Heading>,
+      )
+      index += 1
+      blockIndex += 1
+      continue
+    }
+
+    if (/^ {0,3}([-*_])(?:\s*\1){2,}\s*$/.test(lines[index])) {
+      blocks.push(<hr key={blockKey} className="my-3 border-0 border-t border-border" />)
+      index += 1
+      blockIndex += 1
+      continue
+    }
+
+    if (/^ {0,3}>\s?/.test(lines[index])) {
+      const quoteLines: string[] = []
+      while (index < lines.length && /^ {0,3}>\s?/.test(lines[index])) {
+        quoteLines.push(lines[index].replace(/^ {0,3}>\s?/, ""))
+        index += 1
+      }
+      blocks.push(
+        <blockquote
+          key={blockKey}
+          className="my-2 border-l-2 border-brand-pink bg-accent px-3 py-2 text-muted-foreground"
+        >
+          {renderMarkdownBlocks(quoteLines.join("\n"), blockKey)}
+        </blockquote>,
+      )
+      blockIndex += 1
+      continue
+    }
+
+    if (
+      index + 1 < lines.length &&
+      lines[index].includes("|") &&
+      isTableDivider(lines[index + 1])
+    ) {
+      const headers = tableCells(lines[index])
+      index += 2
+      const rows: string[][] = []
+      while (index < lines.length && lines[index].trim() !== "" && lines[index].includes("|")) {
+        rows.push(tableCells(lines[index]))
+        index += 1
+      }
+      blocks.push(
+        <div key={blockKey} className="my-2 max-w-full overflow-x-auto">
+          <table className="w-full min-w-max border-collapse text-left text-[11px]">
+            <thead>
+              <tr>
+                {headers.map((header, cellIndex) => (
+                  <th
+                    key={`${blockKey}-header-${cellIndex}`}
+                    className="border border-border bg-muted px-2 py-1 font-semibold"
+                  >
+                    {renderInline(header, `${blockKey}-header-${cellIndex}`)}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row, rowIndex) => (
+                <tr key={`${blockKey}-row-${rowIndex}`}>
+                  {headers.map((_, cellIndex) => (
+                    <td
+                      key={`${blockKey}-cell-${rowIndex}-${cellIndex}`}
+                      className="border border-border px-2 py-1 align-top"
+                    >
+                      {renderInline(
+                        row[cellIndex] ?? "",
+                        `${blockKey}-cell-${rowIndex}-${cellIndex}`,
+                      )}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>,
+      )
+      blockIndex += 1
+      continue
+    }
+
+    const unordered = lines[index].match(/^ {0,3}([-+*])\s+(.+)$/)
+    if (unordered !== null) {
+      const items: string[] = []
+      while (index < lines.length) {
+        const item = lines[index].match(/^ {0,3}([-+*])\s+(.+)$/)
+        if (item === null) break
+        items.push(item[2])
+        index += 1
+      }
+      blocks.push(
+        <ul key={blockKey} className="my-2 list-disc space-y-1 pl-5">
+          {items.map((item, itemIndex) => {
+            const task = item.match(/^\[([ xX])\]\s+(.*)$/)
+            return (
+              <li key={`${blockKey}-item-${itemIndex}`}>
+                {task !== null && (
+                  <span
+                    aria-hidden="true"
+                    className={cn(
+                      "mr-1 inline-flex size-3 items-center justify-center border text-[9px] leading-none",
+                      task[1].toLowerCase() === "x"
+                        ? "border-brand-pink bg-brand-pink text-foreground"
+                        : "border-input",
+                    )}
+                  >
+                    {task[1].toLowerCase() === "x" ? "✓" : ""}
+                  </span>
+                )}
+                {renderInline(task?.[2] ?? item, `${blockKey}-item-${itemIndex}`)}
+              </li>
+            )
+          })}
+        </ul>,
+      )
+      blockIndex += 1
+      continue
+    }
+
+    const ordered = lines[index].match(/^ {0,3}\d+[.)]\s+(.+)$/)
+    if (ordered !== null) {
+      const items: string[] = []
+      while (index < lines.length) {
+        const item = lines[index].match(/^ {0,3}\d+[.)]\s+(.+)$/)
+        if (item === null) break
+        items.push(item[1])
+        index += 1
+      }
+      blocks.push(
+        <ol key={blockKey} className="my-2 list-decimal space-y-1 pl-5">
+          {items.map((item, itemIndex) => (
+            <li key={`${blockKey}-item-${itemIndex}`}>
+              {renderInline(item, `${blockKey}-item-${itemIndex}`)}
+            </li>
+          ))}
+        </ol>,
+      )
+      blockIndex += 1
+      continue
+    }
+
+    const paragraphLines: string[] = []
+    while (
+      index < lines.length &&
+      lines[index].trim() !== "" &&
+      !/^ {0,3}(?:#{1,6}\s|```|~~~|>|[-+*]\s+|\d+[.)]\s+)/.test(lines[index])
+    ) {
+      paragraphLines.push(lines[index])
+      index += 1
+    }
+    blocks.push(
+      <p key={blockKey} className="my-2 whitespace-pre-wrap break-words leading-relaxed">
+        {renderInline(paragraphLines.join("\n"), blockKey)}
+      </p>,
+    )
+    blockIndex += 1
+  }
+
+  return blocks
+}
+
+function MarkdownResponse({ text }: { text: string }) {
+  return (
+    <div className="font-mono text-xs leading-relaxed">
+      {renderMarkdownBlocks(text, "markdown")}
     </div>
   )
 }
@@ -208,7 +527,7 @@ export function ChatSidebar({
                   type="button"
                   disabled={busy}
                   onClick={() => void send(prompt)}
-                  className="border border-foreground bg-foreground px-3 py-2 text-left text-base leading-relaxed text-background transition-opacity hover:opacity-80 disabled:pointer-events-none disabled:opacity-50"
+                  className="border border-foreground bg-foreground px-3 py-2 text-left text-sm leading-relaxed text-background transition-opacity hover:opacity-80 disabled:pointer-events-none disabled:opacity-50"
                 >
                   {prompt}
                 </button>
@@ -241,10 +560,10 @@ export function ChatSidebar({
                   <SqlChip key={index} sql={sql} />
                 ))}
                 {item.text !== "" && (
-                  <p className="whitespace-pre-wrap break-words font-mono text-xs leading-relaxed">
-                    {item.text}
+                  <div className="break-words">
+                    <MarkdownResponse text={item.text} />
                     {item.pending && <span className="animate-step-blink">▍</span>}
-                  </p>
+                  </div>
                 )}
                 {item.error !== null && (
                   <p className="break-words font-mono text-xs text-destructive">
