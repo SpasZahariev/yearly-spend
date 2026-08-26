@@ -101,6 +101,10 @@ pub struct SankeyData {
     pub links: Vec<SankeyLink>,
 }
 
+fn sankey_sort_value(column: u8, incoming: f64, outgoing: f64) -> f64 {
+    if column == 2 { incoming } else { outgoing }
+}
+
 fn cents(value: f64) -> f64 {
     (value * 100.0).round() / 100.0
 }
@@ -373,7 +377,7 @@ pub fn sankey(conn: &Connection, year: i32, month: Option<u32>) -> anyhow::Resul
             source,
             target,
             value: cents(value),
-            color: "#94a3b8".into(),
+            color: transfer_color(to_id).into(),
             kind: "transfer".into(),
         });
     }
@@ -392,22 +396,26 @@ pub fn sankey(conn: &Connection, year: i32, month: Option<u32>) -> anyhow::Resul
     }
 
     let mut nodes: Vec<SankeyNode> = nodes.into_values().collect();
+    let mut node_totals = HashMap::<String, (f64, f64)>::new();
+    for link in &links {
+        let source = node_totals.entry(link.source.clone()).or_insert((0.0, 0.0));
+        source.1 += link.value;
+        let target = node_totals.entry(link.target.clone()).or_insert((0.0, 0.0));
+        target.0 += link.value;
+    }
     for node in &mut nodes {
-        let incoming = links
-            .iter()
-            .filter(|link| link.target == node.id)
-            .map(|link| link.value)
-            .sum::<f64>();
-        let outgoing = links
-            .iter()
-            .filter(|link| link.source == node.id)
-            .map(|link| link.value)
-            .sum::<f64>();
+        let (incoming, outgoing) = node_totals.get(&node.id).copied().unwrap_or((0.0, 0.0));
         node.value = cents(incoming.max(outgoing));
     }
     nodes.sort_by(|a, b| {
+        let (a_incoming, a_outgoing) = node_totals.get(&a.id).copied().unwrap_or((0.0, 0.0));
+        let (b_incoming, b_outgoing) = node_totals.get(&b.id).copied().unwrap_or((0.0, 0.0));
         a.column
             .cmp(&b.column)
+            .then_with(|| {
+                sankey_sort_value(b.column, b_incoming, b_outgoing)
+                    .total_cmp(&sankey_sort_value(a.column, a_incoming, a_outgoing))
+            })
             .then_with(|| b.value.total_cmp(&a.value))
             .then_with(|| a.label.cmp(&b.label))
     });
@@ -442,6 +450,15 @@ fn account_color(id: i64) -> &'static str {
         2 => "#111111",
         3 => "#0ea5e9",
         _ => "#8b5cf6",
+    }
+}
+
+fn transfer_color(target_account_id: i64) -> &'static str {
+    match target_account_id {
+        1 => "#d946ef",
+        2 => "#a855f7",
+        3 => "#06b6d4",
+        _ => "#a855f7",
     }
 }
 
@@ -891,6 +908,83 @@ mod tests {
                 ("category:travel", 2, 250.5),
                 ("category:food", 2, 175.25),
             ]
+        );
+    }
+
+    #[test]
+    fn sankey_sorts_source_columns_by_outgoing_and_outputs_by_incoming() {
+        let conn = seeded();
+        let food_id: i64 = conn
+            .query_row("SELECT id FROM categories WHERE name = 'food'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let travel_id: i64 = conn
+            .query_row(
+                "SELECT id FROM categories WHERE name = 'travel'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        conn.execute(
+            "INSERT INTO transactions
+                (account_id, source, source_key, dt, description, category_id,
+                 amount_orig, currency_orig, amount_chf, kind)
+             VALUES
+                (2, 'test', 'a2-food', '2025-01-02', 'x', ?, -80.0, 'CHF', -80.0, 'spend'),
+                (3, 'test', 'a3-travel', '2025-01-03', 'x', ?, -120.0, 'CHF', -120.0, 'spend')",
+            duckdb::params![food_id, travel_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO transfer_groups (from_account_id, to_account_id, amount_chf, dt)
+             VALUES
+                (1, 2, 500.0, '2025-01-01'),
+                (1, 3, 50.0, '2025-01-01')",
+            [],
+        )
+        .unwrap();
+
+        let got = sankey(&conn, 2025, None).unwrap();
+        assert_eq!(
+            got.nodes
+                .iter()
+                .filter(|node| node.column == 1)
+                .map(|node| node.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["account:3", "account:2"]
+        );
+        assert_eq!(
+            got.nodes
+                .iter()
+                .filter(|node| node.column == 2)
+                .map(|node| node.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["category:travel", "category:food"]
+        );
+    }
+
+    #[test]
+    fn sankey_transfer_links_use_target_specific_colors() {
+        let conn = seeded();
+        conn.execute(
+            "INSERT INTO transfer_groups (from_account_id, to_account_id, amount_chf, dt)
+             VALUES
+                (1, 2, 500.0, '2025-01-01'),
+                (1, 3, 300.0, '2025-01-02')",
+            [],
+        )
+        .unwrap();
+
+        let got = sankey(&conn, 2025, None).unwrap();
+        assert_eq!(
+            got.links
+                .iter()
+                .filter(|link| link.kind == "transfer")
+                .map(|link| (link.target.as_str(), link.color.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("account:2", "#a855f7"), ("account:3", "#06b6d4"),]
         );
     }
 

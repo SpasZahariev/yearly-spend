@@ -20,6 +20,7 @@ import { SankeyDiagram, type SankeyData } from "@/components/SankeyDiagram"
 import { Card, CardContent, CardDescription, CardHeader } from "@/components/ui/card"
 import { getJson } from "@/lib/api"
 import { MONTH_LABELS, periodLabel, type Currency, type Granularity, type View } from "@/lib/format"
+import { anchorFromClick, cn } from "@/lib/utils"
 import type { Selection } from "@/types"
 
 interface Summary {
@@ -96,29 +97,64 @@ function fetchMonthData(year: number, month: number, granularity: Granularity): 
   }))
 }
 
+type KpiMetric = "income" | "spend" | "moved"
+
 function KpiCard({
-  label,
+  metric,
   value,
   period,
   currency,
   format,
+  year,
+  month,
+  onPin,
 }: {
-  label: string
+  metric: KpiMetric
   value: number
   period: string
   currency: Currency
   format: (value: number) => string
+  year: number | null
+  month: number | null
+  onPin: (selection: Selection, anchor: { x: number; y: number }) => void
 }) {
+  function pin(event: { clientX?: number; clientY?: number; currentTarget: Element }) {
+    onPin(
+      {
+        chart: "summary",
+        series: metric,
+        label: `${metric} ${period}`,
+        value,
+        year: year ?? undefined,
+        month: month ?? undefined,
+      },
+      anchorFromClick(event),
+    )
+  }
+
   return (
     <Card className="animate-step-in border-l-2 border-l-brand-pink">
       <CardContent className="p-6">
         <div className="inline-flex items-stretch gap-0">
           <span className="text-band text-xs font-semibold uppercase tracking-[0.08em]">
-            {label}
+            {metric}
           </span>
           <span className="text-tag">{currency}</span>
         </div>
-        <div className="mt-3 font-display text-3xl font-semibold leading-none tracking-[-0.05em]">
+        <div
+          role="button"
+          tabIndex={0}
+          aria-label={`Pin ${metric} for ${period}`}
+          title={`pin ${metric} for ${period}`}
+          className="mt-3 w-fit cursor-pointer rounded-sm px-1 font-display text-3xl font-semibold leading-none tracking-[-0.05em] decoration-2 underline-offset-[0.2em] outline-none transition-colors hover:bg-brand-pink/10 hover:underline focus-visible:bg-brand-pink/10 focus-visible:underline"
+          onClick={(event) => pin(event)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault()
+              pin(event)
+            }
+          }}
+        >
           {format(value)}
         </div>
         <div className="mt-3 text-xs text-muted-foreground">{period}</div>
@@ -157,7 +193,7 @@ function YearlySpendChart({
   points: YearlyPoint[]
   format: (value: number) => string
   compact: (value: number) => string
-  onPin: (selection: Selection) => void
+  onPin: (selection: Selection, anchor: { x: number; y: number }) => void
 }) {
   const data = points.map((point) => ({
     label: String(point.year),
@@ -193,16 +229,19 @@ function YearlySpendChart({
           strokeWidth={2}
           isAnimationActive={false}
           className="cursor-pointer"
-          onClick={(entry: { payload?: { year: number; spend: number } }) => {
+          onClick={(entry: { payload?: { year: number; spend: number } }, _index, event) => {
             const point = entry?.payload
-            if (point === undefined) return
-            onPin({
-              chart: "yearly",
-              series: "spend",
-              label: String(point.year),
-              value: point.spend,
-              year: point.year,
-            })
+            if (point === undefined || event === undefined) return
+            onPin(
+              {
+                chart: "yearly",
+                series: "spend",
+                label: String(point.year),
+                value: point.spend,
+                year: point.year,
+              },
+              anchorFromClick(event),
+            )
           }}
         >
           {data.map((point) => (
@@ -228,7 +267,7 @@ function CumulativeChart({
   points: CumulativePoint[]
   format: (value: number) => string
   compact: (value: number) => string
-  onPin: (selection: Selection) => void
+  onPin: (selection: Selection, anchor: { x: number; y: number }) => void
 }) {
   const data = points.map((point) => ({
     label: MONTH_LABELS[point.month - 1],
@@ -240,18 +279,21 @@ function CumulativeChart({
       <LineChart
         data={data}
         margin={{ top: 8, right: 8, bottom: 0, left: 0 }}
-        onClick={(state: { activeLabel?: string | number | undefined }) => {
-          if (typeof state.activeLabel !== "string") return
-          const point = data[MONTH_LABELS.indexOf(state.activeLabel)]
+        onClick={(state, event) => {
+          if (event === undefined || typeof state.activeTooltipIndex !== "number") return
+          const point = data[state.activeTooltipIndex]
           if (point === undefined) return
-          onPin({
-            chart: "cumulative",
-            series: "cumulative",
-            label: `${year}-${String(point.month).padStart(2, "0")}`,
-            value: point.cumulative,
-            year,
-            month: point.month,
-          })
+          onPin(
+            {
+              chart: "cumulative",
+              series: "cumulative",
+              label: `${year}-${String(point.month).padStart(2, "0")}`,
+              value: point.cumulative,
+              year,
+              month: point.month,
+            },
+            anchorFromClick(event),
+          )
         }}
       >
         <CartesianGrid vertical={false} stroke="var(--muted)" />
@@ -302,7 +344,7 @@ function MonthlySpendChart({
   selectedMonth: number
   format: (value: number) => string
   compact: (value: number) => string
-  onPin: (selection: Selection) => void
+  onPin: (selection: Selection, anchor: { x: number; y: number }) => void
 }) {
   const data = months.map((point) => ({
     label: MONTH_LABELS[point.month - 1],
@@ -339,17 +381,20 @@ function MonthlySpendChart({
           strokeWidth={2}
           isAnimationActive={false}
           className="cursor-pointer"
-          onClick={(entry: { payload?: { month: number; spend: number } }) => {
+          onClick={(entry: { payload?: { month: number; spend: number } }, _index, event) => {
             const point = entry?.payload
-            if (point === undefined) return
-            onPin({
-              chart: "monthly",
-              series: "spend",
-              label: `${year}-${String(point.month).padStart(2, "0")}`,
-              value: point.spend,
-              year,
-              month: point.month,
-            })
+            if (point === undefined || event === undefined) return
+            onPin(
+              {
+                chart: "monthly",
+                series: "spend",
+                label: `${year}-${String(point.month).padStart(2, "0")}`,
+                value: point.spend,
+                year,
+                month: point.month,
+              },
+              anchorFromClick(event),
+            )
           }}
         >
           {data.map((point) => (
@@ -377,7 +422,7 @@ function DailySpendChart({
   days: DailyPoint[]
   format: (value: number) => string
   compact: (value: number) => string
-  onPin: (selection: Selection) => void
+  onPin: (selection: Selection, anchor: { x: number; y: number }) => void
 }) {
   const data = days.map((point) => ({
     label: String(point.day),
@@ -415,17 +460,20 @@ function DailySpendChart({
           strokeWidth={1}
           isAnimationActive={false}
           className="cursor-pointer"
-          onClick={(entry: { payload?: { day: number; spend: number } }) => {
+          onClick={(entry: { payload?: { day: number; spend: number } }, _index, event) => {
             const point = entry?.payload
-            if (point === undefined) return
-            onPin({
-              chart: "daily",
-              series: "spend",
-              label: `${year}-${String(month).padStart(2, "0")}-${String(point.day).padStart(2, "0")}`,
-              value: point.spend,
-              year,
-              month,
-            })
+            if (point === undefined || event === undefined) return
+            onPin(
+              {
+                chart: "daily",
+                series: "spend",
+                label: `${year}-${String(month).padStart(2, "0")}-${String(point.day).padStart(2, "0")}`,
+                value: point.spend,
+                year,
+                month,
+              },
+              anchorFromClick(event),
+            )
           }}
         />
       </BarChart>
@@ -442,10 +490,12 @@ function CategoryDonut({
 }: {
   slices: CategorySlice[]
   format: (value: number) => string
-  onPin: (selection: Selection) => void
+  onPin: (selection: Selection, anchor: { x: number; y: number }) => void
   year: number | null
   month: number | null
 }) {
+  const [hovered, setHovered] = useState<string | null>(null)
+
   if (slices.length === 0) {
     return (
       <div className="flex h-72 items-center justify-center font-mono text-sm text-muted-foreground">
@@ -453,6 +503,25 @@ function CategoryDonut({
       </div>
     )
   }
+
+  function pinSlice(
+    slice: CategorySlice,
+    event: { clientX?: number; clientY?: number; currentTarget: Element },
+  ) {
+    onPin(
+      {
+        chart: "categories",
+        series: "spend",
+        label: slice.name,
+        value: slice.value,
+        year: year ?? undefined,
+        month: month ?? undefined,
+        category: slice.name,
+      },
+      anchorFromClick(event),
+    )
+  }
+
   return (
     <div className="flex flex-col gap-5">
       <div className="mx-auto h-64 w-full sm:h-72">
@@ -469,22 +538,24 @@ function CategoryDonut({
               strokeWidth={2}
               isAnimationActive={false}
               className="cursor-pointer"
-              onClick={(entry: { payload?: { name: string; value: number } }) => {
+              onMouseEnter={(entry: { payload?: CategorySlice }) => {
                 const slice = entry?.payload
-                if (slice === undefined) return
-                onPin({
-                  chart: "categories",
-                  series: "spend",
-                  label: slice.name,
-                  value: slice.value,
-                  year: year ?? undefined,
-                  month: month ?? undefined,
-                  category: slice.name,
-                })
+                if (slice !== undefined) setHovered(slice.name)
+              }}
+              onMouseLeave={() => setHovered(null)}
+              onClick={(entry: { payload?: CategorySlice }, _index, event) => {
+                const slice = entry?.payload
+                if (slice === undefined || event === undefined) return
+                pinSlice(slice, event)
               }}
             >
               {slices.map((slice) => (
-                <Cell key={slice.name} fill={slice.color} />
+                <Cell
+                  key={slice.name}
+                  fill={slice.color}
+                  fillOpacity={hovered === null || hovered === slice.name ? 1 : 0.25}
+                  style={{ transition: "fill-opacity 150ms ease" }}
+                />
               ))}
             </Pie>
             <Tooltip
@@ -495,23 +566,41 @@ function CategoryDonut({
         </ResponsiveContainer>
       </div>
       <ul className="grid grid-cols-[repeat(auto-fill,minmax(min(300px,100%),1fr))] gap-x-6 gap-y-1.5">
-        {slices.map((slice) => (
-          <li
-            key={slice.name}
-            className="flex flex-wrap items-center gap-2 font-mono text-sm text-foreground"
-          >
-            <span
-              aria-hidden="true"
-              className="size-4 shrink-0 border border-border"
-              style={{ backgroundColor: slice.color }}
-            />
-            <span>{slice.name}</span>
-            <span className="ml-auto whitespace-nowrap">{format(slice.value)}</span>
-            <span className="w-12 text-right text-muted-foreground">
-              {slice.percentage.toFixed(1)}%
-            </span>
-          </li>
-        ))}
+        {slices.map((slice) => {
+          const isHovered = hovered === slice.name
+          return (
+            <li
+              key={slice.name}
+              tabIndex={0}
+              role="button"
+              aria-label={`${slice.name}, ${format(slice.value)}`}
+              className={cn(
+                "flex cursor-pointer flex-wrap items-center gap-2 font-mono text-sm text-foreground outline-none",
+                isHovered && "font-semibold underline decoration-2 underline-offset-4",
+              )}
+              onMouseEnter={() => setHovered(slice.name)}
+              onMouseLeave={() => setHovered(null)}
+              onClick={(event) => pinSlice(slice, event)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault()
+                  pinSlice(slice, event)
+                }
+              }}
+            >
+              <span
+                aria-hidden="true"
+                className="size-4 shrink-0 border border-border"
+                style={{ backgroundColor: slice.color }}
+              />
+              <span>{slice.name}</span>
+              <span className="ml-auto whitespace-nowrap">{format(slice.value)}</span>
+              <span className="w-12 text-right text-muted-foreground">
+                {slice.percentage.toFixed(1)}%
+              </span>
+            </li>
+          )
+        })}
       </ul>
     </div>
   )
@@ -526,7 +615,7 @@ export interface DashboardProps {
   error: string | null
   format: (value: number) => string
   compact: (value: number) => string
-  onPin: (selection: Selection) => void
+  onPin: (selection: Selection, anchor: { x: number; y: number }) => void
   reportError: (error: string | null) => void
 }
 
@@ -598,25 +687,34 @@ export function Dashboard({
         {current !== null && fxReady && (
           <div className="grid grid-cols-1 gap-6 sm:grid-cols-3">
             <KpiCard
-              label="income"
+              metric="income"
               value={current.summary.income}
               period={label}
               currency={currency}
               format={format}
+              year={year}
+              month={month}
+              onPin={onPin}
             />
             <KpiCard
-              label="spend"
+              metric="spend"
               value={current.summary.spend}
               period={label}
               currency={currency}
               format={format}
+              year={year}
+              month={month}
+              onPin={onPin}
             />
             <KpiCard
-              label="moved"
+              metric="moved"
               value={current.summary.moved}
               period={label}
               currency={currency}
               format={format}
+              year={year}
+              month={month}
+              onPin={onPin}
             />
           </div>
         )}
@@ -631,7 +729,7 @@ export function Dashboard({
             </CardHeader>
             <CardContent>
               {loading || sankey === null ? (
-                <div className="flex h-[28rem] items-center justify-center font-mono text-sm text-muted-foreground">
+                <div className="flex aspect-[8/9] w-full items-center justify-center font-mono text-sm text-muted-foreground">
                   loading…
                 </div>
               ) : (

@@ -43,6 +43,8 @@ pub enum ChartKind {
     Monthly,
     Daily,
     Categories,
+    Sankey,
+    Summary,
 }
 
 impl std::fmt::Display for ChartKind {
@@ -53,6 +55,8 @@ impl std::fmt::Display for ChartKind {
             Self::Monthly => "monthly",
             Self::Daily => "daily",
             Self::Categories => "categories",
+            Self::Sankey => "sankey",
+            Self::Summary => "summary",
         })
     }
 }
@@ -69,6 +73,7 @@ pub struct Selection {
     pub year: Option<i32>,
     pub month: Option<u32>,
     pub category: Option<String>,
+    pub note: Option<String>,
 }
 
 impl Selection {
@@ -81,6 +86,14 @@ impl Selection {
         }
         if let Some(month) = self.month {
             anyhow::ensure!((1..=12).contains(&month), "selection month must be 1-12");
+        }
+        if let Some(note) = &self.note {
+            let trimmed = note.trim();
+            anyhow::ensure!(!trimmed.is_empty(), "selection note is empty");
+            anyhow::ensure!(
+                trimmed.chars().count() <= 500,
+                "selection note must be 1-500 chars"
+            );
         }
         Ok(())
     }
@@ -897,9 +910,10 @@ fn build_system_prompt(selections: Vec<Selection>) -> String {
     let mut prompt = String::from(BASE_PROMPT);
     prompt.push_str("\n\nPinned chart selections from the dashboard (values in CHF):\n");
     for sel in &selections {
+        let label = serde_json::to_string(&sel.label).unwrap_or_else(|_| "\"\"".to_string());
         prompt.push_str(&format!(
-            "- chart={} series={} label=\"{}\" value={:.2} CHF",
-            sel.chart, sel.series, sel.label, sel.value,
+            "- chart={} series={} label={} value={:.2} CHF",
+            sel.chart, sel.series, label, sel.value,
         ));
         if let Some(year) = sel.year {
             prompt.push_str(&format!(" year={year}"));
@@ -910,11 +924,16 @@ fn build_system_prompt(selections: Vec<Selection>) -> String {
         if let Some(category) = &sel.category {
             prompt.push_str(&format!(" category={category}"));
         }
+        if let Some(note) = &sel.note {
+            let note = serde_json::to_string(note).unwrap_or_else(|_| "\"\"".to_string());
+            prompt.push_str(&format!(" note={note}"));
+        }
         prompt.push('\n');
     }
     prompt.push_str(
         "Interpret the user's question in the context of these pinned selections \
-(unless they say otherwise): their year/month scope, the highlighted element and value.\n",
+(unless they say otherwise): their year/month scope, the highlighted element and value, \
+and any attached note.\n",
     );
     prompt
 }
@@ -1013,6 +1032,7 @@ mod tests {
             year: Some(2025),
             month: Some(3),
             category: None,
+            note: None,
         };
         assert!(ok.validate().is_ok());
 
@@ -1028,24 +1048,47 @@ mod tests {
         bad = ok.clone();
         bad.year = Some(99);
         assert!(bad.validate().is_err());
+        bad = ok.clone();
+        bad.note = Some(" ".into());
+        assert!(bad.validate().is_err());
+        bad = ok.clone();
+        bad.note = Some("x".repeat(501));
+        assert!(bad.validate().is_err());
     }
 
     #[test]
     fn system_prompt_includes_pinned_context() {
-        let prompt = build_system_prompt(vec![Selection {
-            chart: ChartKind::Categories,
-            series: "category".into(),
-            label: "food".into(),
-            value: 99.999,
-            year: Some(2025),
-            month: Some(3),
-            category: Some("food".into()),
-        }]);
+        let prompt = build_system_prompt(vec![
+            Selection {
+                chart: ChartKind::Categories,
+                series: "category".into(),
+                label: "food".into(),
+                value: 99.999,
+                year: Some(2025),
+                month: Some(3),
+                category: Some("food".into()),
+                note: Some("flag this spike".into()),
+            },
+            Selection {
+                chart: ChartKind::Summary,
+                series: "spend".into(),
+                label: "spend 2025".into(),
+                value: 26303.21,
+                year: Some(2025),
+                month: None,
+                category: None,
+                note: None,
+            },
+        ]);
         assert!(prompt.contains("Pinned chart selections"));
+        assert!(
+            prompt.contains(r#"chart=summary series=spend label="spend 2025" value=26303.21 CHF"#,)
+        );
         assert!(prompt.contains(r#"label="food" value=100.00 CHF"#));
         assert!(prompt.contains("year=2025"));
         assert!(prompt.contains("month=3"));
         assert!(prompt.contains("category=food"));
+        assert!(prompt.contains(r#"note="flag this spike""#));
         assert_eq!(build_system_prompt(Vec::new()), BASE_PROMPT);
     }
 }

@@ -1511,6 +1511,22 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "body: {sse}");
+        // Empty note -> 400.
+        let (status, sse) = post_chat(
+            &app,
+            &serde_json::json!({
+                "message": "hi",
+                "selections": [{
+                    "chart": "monthly",
+                    "series": "spend",
+                    "label": "2025-01",
+                    "value": 1.0,
+                    "note": "   "
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {sse}");
         // Non-finite selection value (1e309 overflows f64) -> 400 at JSON parse.
         let (status, sse) = post_chat_raw(
             &app,
@@ -1532,6 +1548,23 @@ mod tests {
         let (status, sse) = post_chat(
             &app,
             &serde_json::json!({ "message": "hi", "selections": selections }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {sse}");
+        // Sankey selections and notes are accepted.
+        let (status, sse) = post_chat(
+            &app,
+            &serde_json::json!({
+                "message": "hi",
+                "selections": [{
+                    "chart": "sankey",
+                    "series": "spend",
+                    "label": "cash -> groceries",
+                    "value": 42.0,
+                    "year": 2025,
+                    "note": "look into this"
+                }]
+            }),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "body: {sse}");

@@ -31,17 +31,26 @@ function SelectionChip({
   format: (value: number) => string
 }) {
   return (
-    <span className="inline-flex max-w-full items-center gap-2 border border-border bg-accent px-2 py-1 text-[11px] leading-none">
-      <span className="shrink-0 uppercase tracking-widest text-muted-foreground">
-        {selection.chart}
+    <span className="inline-flex max-w-full items-start gap-2 border border-border bg-accent px-2 py-1 text-[11px] leading-none">
+      <span className="min-w-0 flex-1">
+        <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
+          <span className="shrink-0 uppercase tracking-widest text-muted-foreground">
+            {selection.chart}
+          </span>
+          <span className="truncate">{selection.label}</span>
+          <span className="shrink-0">{format(selection.value)}</span>
+        </span>
+        {selection.note !== undefined && (
+          <span className="mt-1 block whitespace-pre-wrap break-words leading-relaxed text-muted-foreground">
+            {selection.note}
+          </span>
+        )}
       </span>
-      <span className="truncate">{selection.label}</span>
-      <span className="shrink-0">{format(selection.value)}</span>
       <button
         type="button"
         aria-label={`unpin ${selection.chart} ${selection.label}`}
         onClick={() => onUnpin(selection)}
-        className="shrink-0 border border-border px-1 text-xs leading-none hover:bg-background"
+        className="mt-px shrink-0 border border-border px-1 text-xs leading-none hover:bg-background"
       >
         ×
       </button>

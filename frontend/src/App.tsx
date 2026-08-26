@@ -3,6 +3,7 @@ import { ChevronDown, MessageCircle } from "lucide-react"
 
 import { ChatSidebar } from "@/components/ChatSidebar"
 import { EmptyState } from "@/components/EmptyState"
+import { PinNotePopover } from "@/components/PinNotePopover"
 import { Segmented } from "@/components/Segmented"
 import { getJson } from "@/lib/api"
 import {
@@ -36,6 +37,15 @@ interface Meta {
 }
 
 type Route = "dashboard" | "transactions"
+
+interface PendingSelection {
+  selection: Selection
+  anchor: {
+    x: number
+    y: number
+  }
+  initialNote: string
+}
 
 // Two hash routes: `#/` (dashboard) and `#/transactions` (transactions
 // table). Hash routing keeps the SPA fallback and back/forward buttons
@@ -172,19 +182,32 @@ export default function App() {
   const [fx, setFx] = useState<Partial<Record<Currency, FxState>>>({})
   const [selections, setSelections] = useState<Selection[]>([])
   const [chatOpen, setChatOpen] = useState(true)
+  const [pendingSelection, setPendingSelection] = useState<PendingSelection | null>(null)
   const fxRequests = useRef(new Map<Currency, Promise<void>>())
   const lastGoodCurrency = useRef<Currency>("CHF")
 
   // Pins are per-tab state, never persisted. A chart can contribute multiple
-  // pins, but clicking the same chart element again toggles its existing pin.
-  function pinSelection(next: Selection) {
+  // pins, but one chart element only keeps one pin. Re-submitting updates the
+  // note instead of duplicating the pin.
+  function saveSelection(next: Selection) {
     setSelections((prev) => {
       const key = selectionKey(next)
       const existingIndex = prev.findIndex((selection) => selectionKey(selection) === key)
       if (existingIndex !== -1) {
-        return prev.filter((_, index) => index !== existingIndex)
+        return prev.map((selection, index) => (index === existingIndex ? next : selection))
       }
       return [...prev, next]
+    })
+  }
+
+  function requestPin(selection: Selection, anchor: { x: number; y: number }) {
+    const existing = selections.find(
+      (candidate) => selectionKey(candidate) === selectionKey(selection),
+    )
+    setPendingSelection({
+      selection,
+      anchor,
+      initialNote: existing?.note ?? "",
     })
   }
 
@@ -193,6 +216,16 @@ export default function App() {
       prev.filter((selection) => selectionKey(selection) !== selectionKey(target)),
     )
   }
+
+  useEffect(() => {
+    function clearPendingSelectionOnRouteChange() {
+      if (parseRoute(window.location.hash) !== "dashboard") {
+        setPendingSelection(null)
+      }
+    }
+    window.addEventListener("hashchange", clearPendingSelectionOnRouteChange)
+    return () => window.removeEventListener("hashchange", clearPendingSelectionOnRouteChange)
+  }, [])
 
   // One /api/fx call per currency, cached for the session: re-renders and
   // re-toggles within the same currency never hit the FX endpoint again.
@@ -359,7 +392,7 @@ export default function App() {
             error={error}
             format={format}
             compact={compact}
-            onPin={pinSelection}
+            onPin={requestPin}
             reportError={setError}
           />
         )}
@@ -373,6 +406,24 @@ export default function App() {
           />
         )}
       </div>
+
+      {route === "dashboard" && pendingSelection !== null && (
+        <PinNotePopover
+          key={`${selectionKey(pendingSelection.selection)}:${pendingSelection.initialNote}`}
+          selection={pendingSelection.selection}
+          anchor={pendingSelection.anchor}
+          initialNote={pendingSelection.initialNote}
+          format={format}
+          onCancel={() => setPendingSelection(null)}
+          onSubmit={(selection, note) => {
+            saveSelection({
+              ...selection,
+              note: note === "" ? undefined : note,
+            })
+            setPendingSelection(null)
+          }}
+        />
+      )}
 
       <footer className="border-t border-border px-4 py-3">
         <div className="flex w-full items-center justify-between text-xs text-muted-foreground">

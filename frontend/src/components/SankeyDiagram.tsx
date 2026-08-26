@@ -1,5 +1,6 @@
-import { useMemo, useState } from "react"
+import { useMemo, useState, type MouseEvent } from "react"
 
+import { anchorFromClick } from "@/lib/utils"
 import type { Selection } from "@/types"
 
 export interface SankeyNodeData {
@@ -28,7 +29,21 @@ export interface SankeyData {
 interface SankeyDiagramProps {
   data: SankeyData
   format: (value: number) => string
-  onPin: (selection: Selection) => void
+  onPin: (selection: Selection, anchor: { x: number; y: number }) => void
+}
+
+interface HoverState {
+  linkId: string | null
+  nodeIds: string[]
+}
+
+interface NodeTotals {
+  incoming: number
+  outgoing: number
+}
+
+interface FlowNodeData extends SankeyNodeData {
+  totals: NodeTotals
 }
 
 interface PositionedNode extends SankeyNodeData {
@@ -39,6 +54,7 @@ interface PositionedNode extends SankeyNodeData {
 }
 
 interface PositionedLink extends SankeyLinkData {
+  id: string
   x0: number
   x1: number
   y0: number
@@ -47,12 +63,25 @@ interface PositionedLink extends SankeyLinkData {
 }
 
 const WIDTH = 960
-const HEIGHT = 520
+const HEIGHT = 1080
 const NODE_WIDTH = 16
-const NODE_GAP = 10
-const TOP = 24
-const BOTTOM = 24
+const NODE_GAP = 22
+const TOP = 32
+const BOTTOM = 32
 const OTHER_COLOR = "#a1a1aa"
+
+function sortMetric(node: FlowNodeData) {
+  return node.column === 2 ? node.totals.incoming : node.totals.outgoing
+}
+
+function pushMapList<T>(map: Map<string, T[]>, key: string, value: T) {
+  const list = map.get(key)
+  if (list === undefined) {
+    map.set(key, [value])
+    return
+  }
+  list.push(value)
+}
 
 function normaliseData(data: SankeyData) {
   const categoryNodes = data.nodes
@@ -81,25 +110,27 @@ function normaliseData(data: SankeyData) {
       ? { ...link, target: "category:other", color: OTHER_COLOR }
       : { ...link },
   )
-  const values = new Map<string, { incoming: number; outgoing: number }>()
+  const totals = new Map<string, NodeTotals>()
   for (const link of links) {
-    const source = values.get(link.source) ?? { incoming: 0, outgoing: 0 }
+    const source = totals.get(link.source) ?? { incoming: 0, outgoing: 0 }
     source.outgoing += link.value
-    values.set(link.source, source)
-    const target = values.get(link.target) ?? { incoming: 0, outgoing: 0 }
+    totals.set(link.source, source)
+    const target = totals.get(link.target) ?? { incoming: 0, outgoing: 0 }
     target.incoming += link.value
-    values.set(link.target, target)
+    totals.set(link.target, target)
   }
 
   return {
     nodes: nodes.map((node) => {
-      const value = values.get(node.id)
+      const value = totals.get(node.id) ?? { incoming: 0, outgoing: 0 }
       return {
         ...node,
-        value: value === undefined ? node.value : Math.max(value.incoming, value.outgoing),
+        totals: value,
+        value: Math.max(value.incoming, value.outgoing),
       }
     }),
     links,
+    totals,
     visibleCategories,
   }
 }
@@ -109,7 +140,10 @@ function layoutSankey(data: SankeyData) {
   const nodesByColumn = [0, 1, 2].map((column) =>
     normalised.nodes
       .filter((node) => node.column === column)
-      .sort((a, b) => b.value - a.value || a.label.localeCompare(b.label)),
+      .sort(
+        (a, b) =>
+          sortMetric(b) - sortMetric(a) || b.value - a.value || a.label.localeCompare(b.label),
+      ),
   )
   const maxTotal = Math.max(
     ...nodesByColumn.map((column) => column.reduce((total, node) => total + node.value, 0)),
@@ -140,38 +174,67 @@ function layoutSankey(data: SankeyData) {
     })
   }
 
-  const outgoing = new Map<string, number>()
-  const incoming = new Map<string, number>()
-  const links: PositionedLink[] = [...normalised.links]
-    .sort((a, b) => {
-      const aTarget = nodes.get(a.target)
-      const bTarget = nodes.get(b.target)
-      return (
-        Number(b.kind === "transfer") - Number(a.kind === "transfer") ||
-        (aTarget?.y ?? 0) - (bTarget?.y ?? 0)
-      )
-    })
-    .flatMap((link) => {
-      const source = nodes.get(link.source)
-      const target = nodes.get(link.target)
-      if (source === undefined || target === undefined) return []
+  const baseLinks: PositionedLink[] = normalised.links.flatMap((link, index) => {
+    const source = nodes.get(link.source)
+    const target = nodes.get(link.target)
+    if (source === undefined || target === undefined) return []
+    return [
+      {
+        ...link,
+        id: `${link.source}:${link.target}:${link.kind}:${index}`,
+        x0: source.x + source.width,
+        x1: target.x,
+        y0: 0,
+        y1: 0,
+        width: Math.max(1.5, link.value * scale),
+      },
+    ]
+  })
 
-      const width = Math.max(1.5, link.value * scale)
-      const y0 = source.y + (outgoing.get(source.id) ?? 0)
-      const y1 = target.y + (incoming.get(target.id) ?? 0)
-      outgoing.set(source.id, (outgoing.get(source.id) ?? 0) + width)
-      incoming.set(target.id, (incoming.get(target.id) ?? 0) + width)
-      return [
-        {
-          ...link,
-          x0: source.x + source.width,
-          x1: target.x,
-          y0,
-          y1,
-          width,
-        },
-      ]
-    })
+  const outgoingBySource = new Map<string, PositionedLink[]>()
+  const incomingByTarget = new Map<string, PositionedLink[]>()
+  for (const link of baseLinks) {
+    pushMapList(outgoingBySource, link.source, link)
+    pushMapList(incomingByTarget, link.target, link)
+  }
+
+  for (const [sourceId, links] of outgoingBySource) {
+    const source = nodes.get(sourceId)
+    if (source === undefined) continue
+    links.sort(
+      (a, b) =>
+        b.value - a.value ||
+        (nodes.get(a.target)?.y ?? 0) - (nodes.get(b.target)?.y ?? 0) ||
+        a.target.localeCompare(b.target) ||
+        a.id.localeCompare(b.id),
+    )
+    let offset = 0
+    for (const link of links) {
+      link.y0 = source.y + offset
+      offset += link.width
+    }
+  }
+
+  for (const [targetId, links] of incomingByTarget) {
+    const target = nodes.get(targetId)
+    if (target === undefined) continue
+    links.sort(
+      (a, b) =>
+        b.value - a.value ||
+        (nodes.get(a.source)?.y ?? 0) - (nodes.get(b.source)?.y ?? 0) ||
+        a.source.localeCompare(b.source) ||
+        a.id.localeCompare(b.id),
+    )
+    let offset = 0
+    for (const link of links) {
+      link.y1 = target.y + offset
+      offset += link.width
+    }
+  }
+
+  const links = baseLinks.sort(
+    (a, b) => a.x0 - b.x0 || a.y0 - b.y0 || b.width - a.width || a.id.localeCompare(b.id),
+  )
 
   return { nodes: [...nodes.values()], links, visibleCategories: normalised.visibleCategories }
 }
@@ -194,48 +257,102 @@ function labelPosition(node: PositionedNode) {
   return { x: node.x + node.width + 10, anchor: "start" as const }
 }
 
+function labelSpaceBelow(node: PositionedNode, nextY: number | undefined) {
+  // The last node in a column has no label below it, so it can always stack
+  // its amount line under the name (the bottom margin absorbs the overflow).
+  if (nextY === undefined) return Number.POSITIVE_INFINITY
+  return nextY - node.y
+}
+
 export function SankeyDiagram({ data, format, onPin }: SankeyDiagramProps) {
-  const [hovered, setHovered] = useState<string | null>(null)
+  const [hovered, setHovered] = useState<HoverState | null>(null)
   const layout = useMemo(() => layoutSankey(data), [data])
 
   if (layout.links.length === 0) {
     return (
-      <div className="flex h-[28rem] items-center justify-center text-sm text-muted-foreground">
+      <div className="flex aspect-[8/9] w-full items-center justify-center text-sm text-muted-foreground">
         no account flows recorded
       </div>
     )
   }
 
   const nodeById = new Map(layout.nodes.map((node) => [node.id, node]))
+  const nextNodeYById = new Map<string, number>()
+  for (const column of [0, 1, 2]) {
+    const nodes = layout.nodes.filter((node) => node.column === column).sort((a, b) => a.y - b.y)
+    for (let index = 0; index < nodes.length - 1; index += 1) {
+      nextNodeYById.set(nodes[index].id, nodes[index + 1].y)
+    }
+  }
   const accountNodes = layout.nodes.filter((node) => node.column < 2)
   const categoryNodes = layout.nodes.filter((node) => node.column === 2)
   const transferLinks = layout.links.filter((link) => link.kind === "transfer")
+  const transferLegendItems = [
+    ...new Map(
+      transferLinks.map((link) => [
+        link.target,
+        {
+          id: link.target,
+          label: nodeById.get(link.target)?.label ?? link.target,
+          color: link.color,
+        },
+      ]),
+    ).values(),
+  ]
 
-  function pinNode(node: PositionedNode) {
-    onPin({
-      chart: "sankey",
-      series: node.column === 2 ? "category" : "account",
-      label: node.label,
-      value: node.value,
-      year: data.year,
-      month: data.month ?? undefined,
-      category: node.column === 2 ? node.label : undefined,
-    })
+  function isNodeHighlighted(nodeId: string) {
+    return hovered?.nodeIds.includes(nodeId) ?? false
   }
 
-  function pinLink(link: PositionedLink) {
+  function isNodeActive(nodeId: string) {
+    return hovered === null || hovered.nodeIds.includes(nodeId)
+  }
+
+  function isLinkActive(link: PositionedLink) {
+    if (hovered === null) return true
+    if (hovered.linkId !== null) return hovered.linkId === link.id
+    return hovered.nodeIds.includes(link.source) || hovered.nodeIds.includes(link.target)
+  }
+
+  function pinNode(node: PositionedNode, event: MouseEvent<SVGGElement>) {
+    onPin(
+      {
+        chart: "sankey",
+        series: node.column === 2 ? "category" : "account",
+        label: node.label,
+        value: node.value,
+        year: data.year,
+        month: data.month ?? undefined,
+        category: node.column === 2 ? node.label : undefined,
+      },
+      anchorFromClick(event),
+    )
+  }
+
+  function hoverNode(nodeId: string) {
+    setHovered({ linkId: null, nodeIds: [nodeId] })
+  }
+
+  function hoverLink(link: PositionedLink) {
+    setHovered({ linkId: link.id, nodeIds: [link.source, link.target] })
+  }
+
+  function pinLink(link: PositionedLink, event: MouseEvent<SVGPathElement>) {
     const source = nodeById.get(link.source)
     const target = nodeById.get(link.target)
     if (source === undefined || target === undefined) return
-    onPin({
-      chart: "sankey",
-      series: link.kind,
-      label: `${source.label} -> ${target.label}`,
-      value: link.value,
-      year: data.year,
-      month: data.month ?? undefined,
-      category: link.kind === "spend" ? target.label : undefined,
-    })
+    onPin(
+      {
+        chart: "sankey",
+        series: link.kind,
+        label: `${source.label} -> ${target.label}`,
+        value: link.value,
+        year: data.year,
+        month: data.month ?? undefined,
+        category: link.kind === "spend" ? target.label : undefined,
+      },
+      anchorFromClick(event),
+    )
   }
 
   return (
@@ -249,11 +366,10 @@ export function SankeyDiagram({ data, format, onPin }: SankeyDiagramProps) {
         >
           <g>
             {layout.links.map((link) => {
-              const isActive =
-                hovered === null || hovered === link.source || hovered === link.target
+              const isActive = isLinkActive(link)
               return (
                 <path
-                  key={`${link.source}:${link.target}:${link.kind}`}
+                  key={link.id}
                   d={ribbonPath(link)}
                   fill={link.color}
                   fillOpacity={
@@ -263,11 +379,11 @@ export function SankeyDiagram({ data, format, onPin }: SankeyDiagramProps) {
                   role="button"
                   tabIndex={0}
                   aria-label={`${link.kind}: ${nodeById.get(link.source)?.label ?? link.source} to ${nodeById.get(link.target)?.label ?? link.target}, ${format(link.value)}`}
-                  onMouseEnter={() => setHovered(link.source)}
+                  onMouseEnter={() => hoverLink(link)}
                   onMouseLeave={() => setHovered(null)}
-                  onFocus={() => setHovered(link.source)}
+                  onFocus={() => hoverLink(link)}
                   onBlur={() => setHovered(null)}
-                  onClick={() => pinLink(link)}
+                  onClick={(event) => pinLink(link, event)}
                 >
                   <title>
                     {link.kind}: {nodeById.get(link.source)?.label} to{" "}
@@ -280,19 +396,24 @@ export function SankeyDiagram({ data, format, onPin }: SankeyDiagramProps) {
 
           <g>
             {layout.nodes.map((node) => {
-              const isActive = hovered === null || hovered === node.id
+              const isActive = isNodeActive(node.id)
+              const isHighlighted = isNodeHighlighted(node.id)
               const label = labelPosition(node)
+              const showStackedLabel =
+                node.column === 2
+                  ? labelSpaceBelow(node, nextNodeYById.get(node.id)) >= 26
+                  : node.height >= 22
               return (
                 <g
                   key={node.id}
                   className="cursor-pointer"
                   role="button"
                   tabIndex={0}
-                  onMouseEnter={() => setHovered(node.id)}
+                  onMouseEnter={() => hoverNode(node.id)}
                   onMouseLeave={() => setHovered(null)}
-                  onFocus={() => setHovered(node.id)}
+                  onFocus={() => hoverNode(node.id)}
                   onBlur={() => setHovered(null)}
-                  onClick={() => pinNode(node)}
+                  onClick={(event) => pinNode(node, event)}
                   aria-label={`${node.label}, ${format(node.value)}`}
                 >
                   <rect
@@ -303,14 +424,15 @@ export function SankeyDiagram({ data, format, onPin }: SankeyDiagramProps) {
                     fill={node.color}
                     fillOpacity={isActive ? 1 : 0.35}
                   />
-                  {node.height < 22 ? (
+                  {!showStackedLabel ? (
                     <text
                       x={label.x}
                       y={node.y + node.height / 2 + 4}
                       textAnchor={label.anchor}
                       fill="#111111"
                       fontSize="12"
-                      fontWeight="600"
+                      fontWeight={isHighlighted ? "700" : "600"}
+                      textDecoration={isHighlighted ? "underline" : "none"}
                     >
                       {node.label} · {format(node.value)}
                     </text>
@@ -318,20 +440,26 @@ export function SankeyDiagram({ data, format, onPin }: SankeyDiagramProps) {
                     <>
                       <text
                         x={label.x}
-                        y={node.y + Math.min(node.height / 2, 10)}
+                        y={node.column === 2 ? node.y + 12 : node.y + Math.min(node.height / 2, 10)}
                         textAnchor={label.anchor}
                         fill="#111111"
                         fontSize="14"
-                        fontWeight="600"
+                        fontWeight={isHighlighted ? "700" : "600"}
+                        textDecoration={isHighlighted ? "underline" : "none"}
                       >
                         {node.label}
                       </text>
                       <text
                         x={label.x}
-                        y={node.y + Math.min(node.height / 2, 10) + 17}
+                        y={
+                          node.column === 2
+                            ? node.y + 28
+                            : node.y + Math.min(node.height / 2, 10) + 17
+                        }
                         textAnchor={label.anchor}
                         fill="#6d6d6d"
                         fontSize="12"
+                        fontWeight={isHighlighted ? "600" : "400"}
                       >
                         {format(node.value)}
                       </text>
@@ -349,10 +477,21 @@ export function SankeyDiagram({ data, format, onPin }: SankeyDiagramProps) {
           <span className="h-2.5 w-8 bg-brand-pink/70" aria-hidden="true" />
           category spend
         </span>
-        <span className="inline-flex items-center gap-2">
-          <span className="h-2.5 w-8 bg-slate-400/70" aria-hidden="true" />
-          paired account transfers
-        </span>
+        {transferLegendItems.length > 0 && (
+          <span className="inline-flex flex-wrap items-center gap-x-3 gap-y-1">
+            <span>paired account transfers</span>
+            {transferLegendItems.map((item) => (
+              <span key={item.id} className="inline-flex items-center gap-2">
+                <span
+                  className="h-2.5 w-8"
+                  aria-hidden="true"
+                  style={{ backgroundColor: item.color }}
+                />
+                to {item.label}
+              </span>
+            ))}
+          </span>
+        )}
         {categoryNodes.length > 10 && (
           <span>top {Math.min(10, layout.visibleCategories.length)} categories + other</span>
         )}
