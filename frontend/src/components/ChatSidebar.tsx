@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type ReactNode } from "react"
 import { Button } from "@/components/ui/button"
 import { streamChat } from "@/lib/chat"
 import { cn } from "@/lib/utils"
-import { selectionKey, type Selection } from "@/types"
+import { selectionKey, type ChartUpdate, type Selection } from "@/types"
 
 const STARTER_PROMPTS = [
   "What was my biggest spending category this year?",
@@ -17,6 +17,8 @@ type ChatItem =
       role: "assistant"
       text: string
       sql: string[]
+      /** Period labels of the dashboard updates this reply pushed. */
+      charts: string[]
       error: string | null
       pending: boolean
     }
@@ -65,6 +67,17 @@ function SqlChip({ sql }: { sql: string }) {
         run_sql
       </span>
       <code className="break-all text-muted-foreground">{sql}</code>
+    </div>
+  )
+}
+
+function ChartChip({ label }: { label: string }) {
+  return (
+    <div className="mb-1 font-mono text-[11px]">
+      <span className="mr-1 border border-brand-pink bg-brand-pink/10 px-1 py-0.5 text-[10px] font-medium uppercase tracking-[0.12em]">
+        dashboard
+      </span>
+      <span className="text-muted-foreground">updated · {label}</span>
     </div>
   )
 }
@@ -393,12 +406,14 @@ export function ChatSidebar({
   selections,
   onUnpin,
   onClearSelections,
+  onChart,
   format,
 }: {
   open: boolean
   selections: Selection[]
   onUnpin: (selection: Selection) => void
   onClearSelections: () => void
+  onChart: (update: ChartUpdate) => void
   format: (value: number) => string
 }) {
   const [items, setItems] = useState<ChatItem[]>([])
@@ -450,6 +465,7 @@ export function ChatSidebar({
         role: "assistant",
         text: "",
         sql: [],
+        charts: [],
         error: null,
         pending: true,
       },
@@ -466,6 +482,13 @@ export function ChatSidebar({
             patchAssistant(assistantId, (item) => ({ ...item, text: item.text + text })),
           onTool: (sql) =>
             patchAssistant(assistantId, (item) => ({ ...item, sql: [...item.sql, sql] })),
+          onChart: (update) => {
+            onChart(update)
+            patchAssistant(assistantId, (item) => ({
+              ...item,
+              charts: [...item.charts, update.label],
+            }))
+          },
           onError: (error) =>
             patchAssistant(assistantId, (item) => ({ ...item, error, pending: false })),
         },
@@ -527,7 +550,8 @@ export function ChatSidebar({
             </span>
             <p className="font-mono text-xs leading-relaxed text-muted-foreground">
               Click a suggestion or pin a bar, slice or point on the dashboard. The assistant
-              answers from read-only SQL against the DuckDB data.
+              answers from read-only SQL against the DuckDB data and can push the numbers straight
+              onto the charts.
             </p>
             <div className="flex w-full max-w-[300px] flex-col gap-2">
               {STARTER_PROMPTS.map((prompt) => (
@@ -566,7 +590,10 @@ export function ChatSidebar({
                   assistant
                 </div>
                 {item.sql.map((sql, index) => (
-                  <SqlChip key={index} sql={sql} />
+                  <SqlChip key={`sql-${index}`} sql={sql} />
+                ))}
+                {item.charts.map((label, index) => (
+                  <ChartChip key={`chart-${index}`} label={label} />
                 ))}
                 {item.text !== "" && (
                   <div className="break-words">

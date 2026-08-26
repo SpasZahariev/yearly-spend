@@ -20,7 +20,7 @@ import {
 import { cn } from "@/lib/utils"
 import { Dashboard } from "@/pages/Dashboard"
 import { TransactionsPage } from "@/pages/Transactions"
-import { selectionKey, type Category, type Selection } from "@/types"
+import { selectionKey, type Category, type ChartUpdate, type Selection } from "@/types"
 
 interface Account {
   id: number
@@ -181,6 +181,9 @@ export default function App() {
   const [currency, setCurrency] = useState<Currency>("CHF")
   const [fx, setFx] = useState<Partial<Record<Currency, FxState>>>({})
   const [selections, setSelections] = useState<Selection[]>([])
+  // Chart data pushed by the chat's render_dashboard tool. It belongs to
+  // one year; the dashboard only shows it while that year is selected.
+  const [chartUpdate, setChartUpdate] = useState<ChartUpdate | null>(null)
   const [chatOpen, setChatOpen] = useState(true)
   const [pendingSelection, setPendingSelection] = useState<PendingSelection | null>(null)
   const fxRequests = useRef(new Map<Currency, Promise<void>>())
@@ -282,6 +285,21 @@ export default function App() {
     setYear(next)
     setMonth(defaultMonthFor(next, periods))
   }
+
+  function applyChartUpdate(update: ChartUpdate) {
+    setChartUpdate(update)
+    // Switch to the view the override can render in: yearly/cumulative data
+    // lives in the year view, monthly data in the month view.
+    if (update.yearly !== undefined || update.cumulative !== undefined) setView("year")
+    else if (update.monthly !== undefined) setView("month")
+    if (years.includes(update.year)) {
+      setYear(update.year)
+      setMonth(defaultMonthFor(update.year, periods))
+    }
+  }
+
+  const activeChartUpdate =
+    chartUpdate !== null && year !== null && chartUpdate.year === year ? chartUpdate : null
 
   const fxReady = currency === "CHF" || fx[currency] !== undefined
   const rate = fx[currency]?.rate ?? 1
@@ -394,6 +412,9 @@ export default function App() {
             compact={compact}
             onPin={requestPin}
             reportError={setError}
+            chartUpdate={activeChartUpdate}
+            onClearChartUpdate={() => setChartUpdate(null)}
+            taxonomy={taxonomy}
           />
         )}
         {route === "dashboard" && (
@@ -402,6 +423,7 @@ export default function App() {
             selections={selections}
             onUnpin={unpinSelection}
             onClearSelections={() => setSelections([])}
+            onChart={applyChartUpdate}
             format={format}
           />
         )}

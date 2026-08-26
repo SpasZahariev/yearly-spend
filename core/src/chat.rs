@@ -1,12 +1,15 @@
 //! Chat backend for the dashboard inspector: the configured LLM (local
 //! llama-server by default, Gemini when `.env` selects it) streams tokens
-//! over HTTP SSE and may call a single read-only `run_sql` tool.
+//! over HTTP SSE and may call a read-only `run_sql` tool plus
+//! `render_dashboard`, which pushes computed numbers onto the live
+//! dashboard charts.
 //!
 //! The SQL tool is SELECT-only: statements are parsed and rejected unless
 //! they are a single SELECT/WITH-SELECT query, and execution happens on a
 //! short-lived read-only DuckDB connection, so the chat can never write to
 //! the database. Nothing is persisted; every request starts from scratch.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use anyhow::Context;
@@ -33,6 +36,14 @@ const TOOL_NAME: &str = "run_sql";
 const TOOL_DESCRIPTION: &str = "Run a single read-only SELECT query against the \
 spending database (DuckDB) and return up to 100 rows as JSON. Use it to ground \
 every data-related answer in actual query results.";
+
+const RENDER_TOOL_NAME: &str = "render_dashboard";
+const RENDER_TOOL_DESCRIPTION: &str = "Push numbers you already computed with run_sql \
+onto the live dashboard: KPI cards (income/spend/moved), the monthly spend bar \
+chart, the yearly spend bar chart, the cumulative spend line and the category \
+donut. The user sees the data on the dashboard; call it when your answer covers \
+data one of these charts can show, then mention in your reply that the \
+dashboard now shows it.";
 
 /// Which chart a pinned selection chip came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,15 +117,17 @@ pub enum ChatEvent {
     Token(String),
     /// The assistant is invoking the SQL tool with this statement.
     ToolCall { sql: String },
+    /// The assistant pushed chart data onto the dashboard.
+    ChartUpdate(DashboardUpdate),
     /// Terminal error; no further events follow.
     Error(String),
 }
 
-/// A tool call requested by the model, with the parsed `sql` argument.
+/// A tool call requested by the model, with its raw JSON arguments.
 struct PendingCall {
     id: String,
     name: String,
-    sql: String,
+    arguments: serde_json::Value,
 }
 
 /// One completed round trip: assistant output plus the executed tool calls.
@@ -125,8 +138,162 @@ struct Round {
 
 struct ExecutedCall {
     id: String,
-    sql: String,
+    name: String,
+    arguments: serde_json::Value,
     result: String,
+}
+
+/// One point of a month-indexed chart (monthly bars, cumulative line).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MonthPoint {
+    /// 1-12.
+    pub month: u8,
+    /// Positive CHF magnitude.
+    pub value: f64,
+}
+
+/// One point of the yearly spend bar chart.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct YearPoint {
+    pub year: i32,
+    /// Positive CHF magnitude.
+    pub value: f64,
+}
+
+/// One slice of the category donut.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CategoryPoint {
+    /// Must match a row of the categories table.
+    pub name: String,
+    /// Positive CHF magnitude.
+    pub value: f64,
+}
+
+/// KPI card values. All three are required together (validated).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KpiValues {
+    pub income: f64,
+    pub spend: f64,
+    pub moved: f64,
+}
+
+/// Chart data pushed to the dashboard by the `render_dashboard` tool.
+/// All amounts are positive CHF magnitudes; the frontend merges them over
+/// the standard API data for the matching year.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DashboardUpdate {
+    pub year: i32,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kpi: Option<KpiValues>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monthly: Option<Vec<MonthPoint>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yearly: Option<Vec<YearPoint>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cumulative: Option<Vec<MonthPoint>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub categories: Option<Vec<CategoryPoint>>,
+}
+
+impl DashboardUpdate {
+    /// Validate a model-supplied update against the fixed taxonomy and the
+    /// shape constraints of the dashboard charts. Empty sections are treated
+    /// as absent.
+    pub fn validate(&self, category_names: &HashSet<String>) -> Result<(), String> {
+        if !(1000..=3000).contains(&self.year) {
+            return Err("year must be between 1000 and 3000".into());
+        }
+        let label = self.label.trim();
+        if label.is_empty() || label.chars().count() > 40 {
+            return Err("label must be 1-40 chars".into());
+        }
+        let section_present = [
+            self.kpi.is_some(),
+            !self.monthly.as_deref().unwrap_or_default().is_empty(),
+            !self.yearly.as_deref().unwrap_or_default().is_empty(),
+            !self.cumulative.as_deref().unwrap_or_default().is_empty(),
+            !self.categories.as_deref().unwrap_or_default().is_empty(),
+        ];
+        if !section_present.into_iter().any(|present| present) {
+            return Err(
+                "at least one chart section (kpi, monthly, yearly, cumulative, categories) is required".into(),
+            );
+        }
+        if let Some(kpi) = &self.kpi {
+            for (name, value) in [
+                ("income", kpi.income),
+                ("spend", kpi.spend),
+                ("moved", kpi.moved),
+            ] {
+                if !value.is_finite() || value < 0.0 {
+                    return Err(format!("kpi.{name} must be a finite non-negative number"));
+                }
+            }
+        }
+        for (name, points) in [("monthly", &self.monthly), ("cumulative", &self.cumulative)] {
+            let Some(points) = points else {
+                continue;
+            };
+            if points.len() > 12 {
+                return Err(format!("{name} holds at most 12 points"));
+            }
+            let mut seen = [false; 13];
+            for point in points {
+                if !(1..=12).contains(&point.month) {
+                    return Err(format!("{name} month must be 1-12"));
+                }
+                if seen[point.month as usize] {
+                    return Err(format!("duplicate month {} in {name}", point.month));
+                }
+                seen[point.month as usize] = true;
+                if !point.value.is_finite() || point.value < 0.0 {
+                    return Err(format!("{name} values must be finite non-negative numbers"));
+                }
+            }
+        }
+        if let Some(yearly) = &self.yearly {
+            if yearly.len() > 30 {
+                return Err("yearly holds at most 30 points".into());
+            }
+            let mut years: HashSet<i32> = HashSet::new();
+            for point in yearly {
+                if !(1000..=3000).contains(&point.year) {
+                    return Err("yearly years must be between 1000 and 3000".into());
+                }
+                if !years.insert(point.year) {
+                    return Err(format!("duplicate year {} in yearly", point.year));
+                }
+                if !point.value.is_finite() || point.value < 0.0 {
+                    return Err("yearly values must be finite non-negative numbers".into());
+                }
+            }
+        }
+        if let Some(categories) = &self.categories {
+            if categories.len() > 18 {
+                return Err("categories holds at most 18 entries".into());
+            }
+            let mut seen: HashSet<&str> = HashSet::new();
+            for entry in categories {
+                let name = entry.name.trim();
+                if name.is_empty() || !category_names.contains(name) {
+                    return Err(format!(
+                        "unknown category '{}'; use names from the categories table",
+                        entry.name
+                    ));
+                }
+                if !seen.insert(name) {
+                    return Err(format!("duplicate category '{name}'"));
+                }
+                if !entry.value.is_finite() || entry.value < 0.0 {
+                    return Err(format!(
+                        "categories value for '{name}' must be finite non-negative"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 struct StreamOutcome {
@@ -195,7 +362,8 @@ impl Chat {
                 let result = self.exec_call(&call, &tx).await;
                 executed.push(ExecutedCall {
                     id: call.id,
-                    sql: call.sql,
+                    name: call.name,
+                    arguments: call.arguments,
                     result,
                 });
             }
@@ -210,18 +378,56 @@ impl Chat {
     }
 
     async fn exec_call(&self, call: &PendingCall, tx: &UnboundedSender<ChatEvent>) -> String {
-        let _ = tx.send(ChatEvent::ToolCall {
-            sql: call.sql.clone(),
-        });
-        if call.name != TOOL_NAME || call.sql.trim().is_empty() {
-            return format!("error: unknown tool '{}' or missing sql", call.name);
+        match call.name.as_str() {
+            TOOL_NAME => {
+                let sql = call
+                    .arguments
+                    .get("sql")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let _ = tx.send(ChatEvent::ToolCall { sql: sql.clone() });
+                if sql.trim().is_empty() {
+                    return "error: missing sql argument".into();
+                }
+                if let Err(reason) = validate_select_only(&sql) {
+                    return format!("rejected: {reason}");
+                }
+                match run_readonly_sql(self.db_path.clone(), sql).await {
+                    Ok(result) => result,
+                    Err(err) => format!("error: {err}"),
+                }
+            }
+            RENDER_TOOL_NAME => self.exec_render(&call.arguments, tx).await,
+            other => format!("error: unknown tool '{other}'"),
         }
-        if let Err(reason) = validate_select_only(&call.sql) {
-            return format!("rejected: {reason}");
-        }
-        match run_readonly_sql(self.db_path.clone(), call.sql.clone()).await {
-            Ok(result) => result,
-            Err(err) => format!("error: {err}"),
+    }
+
+    /// Validate a `render_dashboard` call and, when it is valid, stream the
+    /// update to the client as a `chart` event. The returned string is the
+    /// tool result fed back to the model.
+    async fn exec_render(
+        &self,
+        arguments: &serde_json::Value,
+        tx: &UnboundedSender<ChatEvent>,
+    ) -> String {
+        let update: DashboardUpdate = match serde_json::from_value(arguments.clone()) {
+            Ok(update) => update,
+            Err(err) => return format!("error: invalid render_dashboard arguments: {err}"),
+        };
+        let category_names = match load_category_names(self.db_path.clone()).await {
+            Ok(names) => names,
+            Err(err) => return format!("error: {err}"),
+        };
+        match update.validate(&category_names) {
+            Ok(()) => {
+                let _ = tx.send(ChatEvent::ChartUpdate(update.clone()));
+                format!(
+                    "ok: dashboard charts updated for {} (year {})",
+                    update.label, update.year
+                )
+            }
+            Err(reason) => format!("rejected: {reason}"),
         }
     }
 
@@ -237,7 +443,7 @@ impl Chat {
             "messages": local_messages(system, user, rounds),
             "temperature": 0.2,
             "stream": true,
-            "tools": [tool_spec_local()],
+            "tools": [tool_spec_local(), render_tool_spec_local()],
             "chat_template_kwargs": { "enable_thinking": false },
         });
         anyhow::ensure!(!self.local_model.is_empty(), "LLM_MODEL is not set");
@@ -311,11 +517,7 @@ impl Chat {
             outcome.calls.push(PendingCall {
                 id: slot.id.unwrap_or_else(|| format!("call_local_{i}")),
                 name: slot.name,
-                sql: args
-                    .get("sql")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
+                arguments: args,
             });
         }
         Ok(outcome)
@@ -335,7 +537,9 @@ impl Chat {
         let body = serde_json::json!({
             "contents": gemini_contents(user, rounds),
             "system_instruction": { "parts": [{ "text": system }] },
-            "tools": [{ "function_declarations": [tool_spec_gemini()] }],
+            "tools": [{
+                "function_declarations": [tool_spec_gemini(), render_tool_spec_gemini()]
+            }],
             "generation_config": { "temperature": 0.2 },
         });
         let response = self
@@ -379,11 +583,7 @@ impl Chat {
                             outcome.calls.push(PendingCall {
                                 id: format!("call_gemini_{}", outcome.calls.len()),
                                 name,
-                                sql: args
-                                    .get("sql")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or_default()
-                                    .to_string(),
+                                arguments: args,
                             });
                         }
                     }
@@ -616,6 +816,23 @@ fn skip_parens(chars: &[char], i: usize) -> Option<usize> {
     None
 }
 
+/// Load the fixed category taxonomy names used to validate
+/// `render_dashboard` category slices.
+async fn load_category_names(db_path: PathBuf) -> anyhow::Result<HashSet<String>> {
+    tokio::task::spawn_blocking(move || {
+        let conn = crate::db::api_connection(&db_path)?;
+        let mut stmt = conn.prepare("SELECT name FROM categories")?;
+        let mut rows = stmt.query([])?;
+        let mut names = HashSet::new();
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(0)?;
+            names.insert(name);
+        }
+        Ok(names)
+    })
+    .await?
+}
+
 /// Execute a validated SELECT on a short-lived read-only connection and
 /// render the rows (capped at `MAX_ROWS`) as a JSON string for the model.
 async fn run_readonly_sql(db_path: PathBuf, sql: String) -> anyhow::Result<String> {
@@ -800,6 +1017,101 @@ fn tool_spec_gemini() -> serde_json::Value {
     })
 }
 
+/// Shared JSON Schema for the `render_dashboard` arguments.
+fn render_tool_parameters() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "year": {
+                "type": "integer",
+                "description": "Year the data covers; it drives the dashboard year picker."
+            },
+            "label": {
+                "type": "string",
+                "description": "Short label of the period the data covers, e.g. '2024' or '2024-03'."
+            },
+            "kpi": {
+                "type": "object",
+                "description": "KPI card values in CHF (positive magnitudes). Provide all three or omit the object.",
+                "properties": {
+                    "income": { "type": "number" },
+                    "spend": { "type": "number" },
+                    "moved": { "type": "number" }
+                },
+                "required": ["income", "spend", "moved"]
+            },
+            "monthly": {
+                "type": "array",
+                "description": "Spend per month (at most 12 entries) for the monthly bar chart.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "month": { "type": "integer", "minimum": 1, "maximum": 12 },
+                        "value": { "type": "number" }
+                    },
+                    "required": ["month", "value"]
+                }
+            },
+            "yearly": {
+                "type": "array",
+                "description": "Total spend per year for the yearly bar chart.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "year": { "type": "integer" },
+                        "value": { "type": "number" }
+                    },
+                    "required": ["year", "value"]
+                }
+            },
+            "cumulative": {
+                "type": "array",
+                "description": "Cumulative spend per month (at most 12 entries) for the cumulative line.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "month": { "type": "integer", "minimum": 1, "maximum": 12 },
+                        "value": { "type": "number" }
+                    },
+                    "required": ["month", "value"]
+                }
+            },
+            "categories": {
+                "type": "array",
+                "description": "Spend per category for the donut; names must match the categories table exactly.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "value": { "type": "number" }
+                    },
+                    "required": ["name", "value"]
+                }
+            }
+        },
+        "required": ["year", "label"]
+    })
+}
+
+fn render_tool_spec_local() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": RENDER_TOOL_NAME,
+            "description": RENDER_TOOL_DESCRIPTION,
+            "parameters": render_tool_parameters()
+        }
+    })
+}
+
+fn render_tool_spec_gemini() -> serde_json::Value {
+    serde_json::json!({
+        "name": RENDER_TOOL_NAME,
+        "description": RENDER_TOOL_DESCRIPTION,
+        "parameters": render_tool_parameters()
+    })
+}
+
 /// OpenAI-compatible wire messages: system + user, then per round an
 /// assistant message with tool_calls and one `tool` message per result.
 fn local_messages(system: &str, user: &str, rounds: &[Round]) -> Vec<serde_json::Value> {
@@ -819,8 +1131,8 @@ fn local_messages(system: &str, user: &str, rounds: &[Round]) -> Vec<serde_json:
                         "id": call.id,
                         "type": "function",
                         "function": {
-                            "name": TOOL_NAME,
-                            "arguments": serde_json::json!({ "sql": call.sql }).to_string(),
+                            "name": call.name,
+                            "arguments": call.arguments.to_string(),
                         },
                     })
                 })
@@ -849,7 +1161,7 @@ fn gemini_contents(user: &str, rounds: &[Round]) -> Vec<serde_json::Value> {
         }
         for call in &round.calls {
             parts.push(serde_json::json!({
-                "function_call": { "name": TOOL_NAME, "args": { "sql": call.sql } },
+                "function_call": { "name": call.name, "args": call.arguments },
             }));
         }
         out.push(serde_json::json!({ "role": "model", "parts": parts }));
@@ -859,7 +1171,7 @@ fn gemini_contents(user: &str, rounds: &[Round]) -> Vec<serde_json::Value> {
             .map(|call| {
                 serde_json::json!({
                     "function_response": {
-                        "name": TOOL_NAME,
+                        "name": call.name,
                         "response": { "content": call.result },
                     },
                 })
@@ -896,9 +1208,30 @@ aggregates must filter kind = 'spend'; transfer and internal rows are never spen
 year(dt), month(dt) and strftime().
 - Category names live in categories; join on transactions.category_id = categories.id.
 
-You have the run_sql tool for read-only SQL (a single SELECT statement). Use it to \
-ground every data-related claim in actual query results; never invent numbers. Make \
-at most a couple of calls, then answer.
+Tools:
+- run_sql: read-only SQL (a single SELECT statement). Use it to ground every \
+data-related claim in actual query results; never invent numbers. Make at most a \
+couple of calls, then answer.
+- render_dashboard: pushes computed numbers onto the live dashboard charts: KPI \
+cards (kpi), the monthly spend bar chart (monthly), the yearly spend bar chart \
+(yearly), the cumulative spend line (cumulative) and the category donut \
+(categories). When the user's question is about data one of these charts can \
+show, compute the values with run_sql, call render_dashboard so the user sees \
+the answer on screen, and briefly say so in your reply. Do not call it for \
+questions the dashboard cannot show (lists of individual transactions, single \
+facts, explanations).
+
+render_dashboard rules:
+- year is the year the data covers; label is a short period label like '2024' \
+or '2024-03'.
+- Values are positive CHF magnitudes. Spend values use the dashboard formula \
+sum(-amount_chf) FILTER (WHERE kind = 'spend') with whatever filters the \
+question implies (year, month, category, account, source).
+- kpi must contain all of income, spend and moved, or be omitted entirely.
+- Provide 'monthly' or 'yearly'/'cumulative', never both: the dashboard shows \
+one of those chart pairs at a time. You may combine charts with kpi and \
+categories in a single call.
+- Category names must match the categories table exactly; query it if unsure.
 
 Style: concise plain prose, exact CHF amounts (two decimals), short lists or tables \
 where they help, and answer the user's question directly.";
@@ -1090,5 +1423,198 @@ mod tests {
         assert!(prompt.contains("category=food"));
         assert!(prompt.contains(r#"note="flag this spike""#));
         assert_eq!(build_system_prompt(Vec::new()), BASE_PROMPT);
+    }
+
+    fn valid_update() -> DashboardUpdate {
+        DashboardUpdate {
+            year: 2024,
+            label: "2024".into(),
+            kpi: Some(KpiValues {
+                income: 10_000.0,
+                spend: 5_000.0,
+                moved: 1_000.0,
+            }),
+            monthly: Some(vec![MonthPoint {
+                month: 1,
+                value: 100.0,
+            }]),
+            yearly: Some(vec![YearPoint {
+                year: 2024,
+                value: 5_000.0,
+            }]),
+            cumulative: Some(vec![MonthPoint {
+                month: 1,
+                value: 100.0,
+            }]),
+            categories: Some(vec![CategoryPoint {
+                name: "food".into(),
+                value: 250.0,
+            }]),
+        }
+    }
+
+    fn taxonomy_names() -> HashSet<String> {
+        ["food", "travel", "housing"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn render_update_validation() {
+        let names = taxonomy_names();
+        assert!(valid_update().validate(&names).is_ok());
+
+        // At least one section is required; empty sections count as absent.
+        let mut update = valid_update();
+        update.kpi = None;
+        update.monthly = Some(vec![]);
+        update.yearly = None;
+        update.cumulative = None;
+        update.categories = None;
+        assert!(update.validate(&names).is_err(), "no sections should fail");
+        update.kpi = Some(KpiValues {
+            income: 0.0,
+            spend: 0.0,
+            moved: 0.0,
+        });
+        assert!(update.validate(&names).is_ok());
+
+        // Year and label bounds.
+        update = valid_update();
+        update.year = 999;
+        assert!(update.validate(&names).is_err());
+        update = valid_update();
+        update.label = "  ".into();
+        assert!(update.validate(&names).is_err());
+        update = valid_update();
+        update.label = "x".repeat(41);
+        assert!(update.validate(&names).is_err());
+
+        // Values must be finite and non-negative.
+        for field in ["income", "spend", "moved"] {
+            update = valid_update();
+            match field {
+                "income" => update.kpi.as_mut().unwrap().income = -1.0,
+                "spend" => update.kpi.as_mut().unwrap().spend = f64::NAN,
+                "moved" => update.kpi.as_mut().unwrap().moved = f64::INFINITY,
+                _ => unreachable!(),
+            }
+            assert!(update.validate(&names).is_err(), "{field} should fail");
+        }
+        update = valid_update();
+        update.monthly.as_mut().unwrap()[0].value = -0.01;
+        assert!(update.validate(&names).is_err());
+        update = valid_update();
+        update.yearly.as_mut().unwrap()[0].value = f64::NAN;
+        assert!(update.validate(&names).is_err());
+
+        // Month index bounds, per-section caps and duplicate keys.
+        update = valid_update();
+        update.monthly.as_mut().unwrap()[0].month = 0;
+        assert!(update.validate(&names).is_err());
+        update = valid_update();
+        update.monthly.as_mut().unwrap()[0].month = 13;
+        assert!(update.validate(&names).is_err());
+        update = valid_update();
+        update.monthly = Some(
+            (1..=13)
+                .map(|month| MonthPoint { month, value: 1.0 })
+                .collect(),
+        );
+        assert!(update.validate(&names).is_err());
+        update = valid_update();
+        update.monthly = Some(vec![
+            MonthPoint {
+                month: 1,
+                value: 1.0,
+            },
+            MonthPoint {
+                month: 1,
+                value: 2.0,
+            },
+        ]);
+        assert!(update.validate(&names).is_err(), "duplicate month");
+        update = valid_update();
+        update.cumulative.as_mut().unwrap()[0].month = 13;
+        assert!(update.validate(&names).is_err());
+        update = valid_update();
+        update.yearly = Some(vec![
+            YearPoint {
+                year: 2024,
+                value: 1.0,
+            },
+            YearPoint {
+                year: 2024,
+                value: 2.0,
+            },
+        ]);
+        assert!(update.validate(&names).is_err(), "duplicate year");
+        update = valid_update();
+        update.yearly.as_mut().unwrap()[0].year = 999;
+        assert!(update.validate(&names).is_err());
+
+        // Category names must come from the taxonomy.
+        update = valid_update();
+        update.categories.as_mut().unwrap()[0].name = "unknown".into();
+        assert!(update.validate(&names).is_err());
+        update = valid_update();
+        update.categories = Some(vec![
+            CategoryPoint {
+                name: "food".into(),
+                value: 1.0,
+            },
+            CategoryPoint {
+                name: "food".into(),
+                value: 2.0,
+            },
+        ]);
+        assert!(update.validate(&names).is_err(), "duplicate category");
+        update = valid_update();
+        update.categories = Some(
+            (0..19)
+                .map(|index| CategoryPoint {
+                    name: if index < 3 {
+                        ["food", "travel", "housing"][index].into()
+                    } else {
+                        format!("filler-{index}")
+                    },
+                    value: 1.0,
+                })
+                .collect(),
+        );
+        assert!(update.validate(&names).is_err(), "18-entry cap");
+    }
+
+    #[test]
+    fn render_update_serializes_only_present_sections() {
+        let update = DashboardUpdate {
+            year: 2024,
+            label: "2024".into(),
+            kpi: None,
+            monthly: Some(vec![MonthPoint {
+                month: 1,
+                value: 1.5,
+            }]),
+            yearly: None,
+            cumulative: None,
+            categories: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&update).unwrap(),
+            serde_json::json!({
+                "year": 2024,
+                "label": "2024",
+                "monthly": [{ "month": 1, "value": 1.5 }]
+            })
+        );
+        // Round trip: missing sections deserialize to None.
+        let parsed: DashboardUpdate = serde_json::from_value(serde_json::json!({
+            "year": 2024,
+            "label": "2024",
+            "monthly": [{ "month": 1, "value": 1.5 }]
+        }))
+        .unwrap();
+        assert_eq!(parsed, update);
     }
 }

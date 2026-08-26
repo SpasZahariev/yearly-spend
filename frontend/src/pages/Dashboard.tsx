@@ -21,7 +21,7 @@ import { Card, CardContent, CardDescription, CardHeader } from "@/components/ui/
 import { getJson } from "@/lib/api"
 import { MONTH_LABELS, periodLabel, type Currency, type Granularity, type View } from "@/lib/format"
 import { anchorFromClick, cn } from "@/lib/utils"
-import type { Selection } from "@/types"
+import type { Category, ChartUpdate, Selection } from "@/types"
 
 interface Summary {
   year: number
@@ -94,6 +94,25 @@ function fetchMonthData(year: number, month: number, granularity: Granularity): 
   return getJson<DailyPoint[]>(`/api/series/daily?year=${year}&month=${month}`).then((days) => ({
     months: [],
     days,
+  }))
+}
+
+/**
+ * Turn the chat's category values into donut slices, keeping the taxonomy
+ * colors. Categories are validated against the taxonomy by the API, so the
+ * color lookup only misses for unknown data.
+ */
+function buildChatSlices(
+  entries: { name: string; value: number }[],
+  taxonomy: Category[],
+): CategorySlice[] {
+  const colorOf = new Map(taxonomy.map((category) => [category.name, category.color]))
+  const total = entries.reduce((sum, entry) => sum + entry.value, 0)
+  return entries.map((entry) => ({
+    name: entry.name,
+    color: colorOf.get(entry.name) ?? "#c0c0c0",
+    value: entry.value,
+    percentage: total > 0 ? (entry.value / total) * 100 : 0,
   }))
 }
 
@@ -617,6 +636,15 @@ export interface DashboardProps {
   compact: (value: number) => string
   onPin: (selection: Selection, anchor: { x: number; y: number }) => void
   reportError: (error: string | null) => void
+  /**
+   * Chart data pushed by the chat for the currently selected year, or
+   * `null` when the chat has not pushed anything (or pushed a different
+   * year). Base API data is always fetched underneath.
+   */
+  chartUpdate: ChartUpdate | null
+  onClearChartUpdate: () => void
+  /** Category taxonomy (colors) for chat-pushed donut slices. */
+  taxonomy: Category[]
 }
 
 export function Dashboard({
@@ -630,6 +658,9 @@ export function Dashboard({
   compact,
   onPin,
   reportError,
+  chartUpdate,
+  onClearChartUpdate,
+  taxonomy,
 }: DashboardProps) {
   const [granularity, setGranularity] = useState<Granularity>("month")
   const [data, setData] = useState<DashboardData | null>(null)
@@ -672,24 +703,86 @@ export function Dashboard({
     data.summary.month === expectedMonth
       ? data
       : null
-  const loading =
-    year !== null && month !== null && error === null && (current === null || !fxReady)
   const label = year !== null && month !== null ? periodLabel(view, year, month) : "…"
-  const summary = current?.summary ?? null
-  const slices = current?.slices ?? []
+
+  // Chat overrides (render_dashboard) merge over the standard API data.
+  // Sections the model did not send keep the base values, so a partial
+  // update only rewrites the charts it was given.
+  const chat = chartUpdate
+  const chatKpi = chat?.kpi
+  const kpi =
+    current !== null && error === null
+      ? {
+          income: chatKpi?.income ?? current.summary.income,
+          spend: chatKpi?.spend ?? current.summary.spend,
+          moved: chatKpi?.moved ?? current.summary.moved,
+        }
+      : chatKpi
+  const slices =
+    chat?.categories !== undefined
+      ? buildChatSlices(chat.categories, taxonomy)
+      : (current?.slices ?? [])
   const sankey = current?.sankey ?? null
-  const yearData = current?.yearData ?? null
-  const monthData = current?.monthData ?? null
+  const yearlyPoints =
+    chat?.yearly?.map((point) => ({ year: point.year, spend: point.value })) ??
+    current?.yearData?.yearly ??
+    []
+  const cumulativePoints =
+    chat?.cumulative?.map((point) => ({ month: point.month, cumulative: point.value })) ??
+    current?.yearData?.cumulative ??
+    []
+  const monthlyPoints =
+    chat?.monthly?.map((point) => ({ month: point.month, spend: point.value })) ??
+    current?.monthData?.months ??
+    []
+  const dailyPoints = current?.monthData?.days ?? []
+
+  const baseReady = current !== null && error === null
+  // A chart can render when its base data is ready or when the chat pushed
+  // that section; the FX gate is relaxed for chat sections because their
+  // values are CHF and only display conversion is pending.
+  const ready = (fromChat: boolean) =>
+    error === null && year !== null && (fxReady || fromChat) && (baseReady || fromChat)
+  const kpiReady = ready(chatKpi !== undefined)
+  const sankeyReady = ready(false)
+  const yearReady = ready(chat?.yearly !== undefined || chat?.cumulative !== undefined)
+  const monthReady = ready(chat?.monthly !== undefined)
+  const dayReady = ready(false)
+  const donutReady = ready(chat?.categories !== undefined)
+  // Period labels: a chat section carries its own period label; base charts
+  // keep the picker's label.
+  const kpiPeriod = chat !== null && chat.kpi !== undefined ? chat.label : label
+  const monthlyPeriod = chat !== null && chat.monthly !== undefined ? chat.label : label
+  const categoryPeriod = chat !== null && chat.categories !== undefined ? chat.label : label
 
   return (
     <main className="min-w-0 flex-1 px-4 py-6 sm:px-6 sm:py-8 lg:overflow-y-auto">
       <div className="mx-auto flex w-full max-w-5xl flex-col gap-4 sm:gap-6">
-        {current !== null && fxReady && (
+        {chat !== null && (
+          <div
+            role="status"
+            className="flex flex-wrap items-center gap-x-3 gap-y-1 border border-brand-pink bg-brand-pink/10 px-3 py-2 font-mono text-xs"
+          >
+            <span className="font-semibold uppercase tracking-[0.12em] text-brand-pink">
+              chat data
+            </span>
+            <span className="text-muted-foreground">charts show {chat.label}</span>
+            <button
+              type="button"
+              onClick={onClearChartUpdate}
+              className="ml-auto border border-border px-2 py-0.5 uppercase tracking-[0.12em] hover:bg-background"
+            >
+              clear
+            </button>
+          </div>
+        )}
+
+        {kpiReady && kpi !== undefined && (
           <div className="grid grid-cols-1 gap-6 sm:grid-cols-3">
             <KpiCard
               metric="income"
-              value={current.summary.income}
-              period={label}
+              value={kpi.income}
+              period={kpiPeriod}
               currency={currency}
               format={format}
               year={year}
@@ -698,8 +791,8 @@ export function Dashboard({
             />
             <KpiCard
               metric="spend"
-              value={current.summary.spend}
-              period={label}
+              value={kpi.spend}
+              period={kpiPeriod}
               currency={currency}
               format={format}
               year={year}
@@ -708,8 +801,8 @@ export function Dashboard({
             />
             <KpiCard
               metric="moved"
-              value={current.summary.moved}
-              period={label}
+              value={kpi.moved}
+              period={kpiPeriod}
               currency={currency}
               format={format}
               year={year}
@@ -728,7 +821,7 @@ export function Dashboard({
               </CardDescription>
             </CardHeader>
             <CardContent>
-              {loading || sankey === null ? (
+              {!sankeyReady || sankey === null ? (
                 <div className="flex aspect-[8/9] w-full items-center justify-center font-mono text-sm text-muted-foreground">
                   loading…
                 </div>
@@ -747,32 +840,38 @@ export function Dashboard({
                 </CardDescription>
               </CardHeader>
               <CardContent className="flex flex-col gap-5">
-                {loading || year === null || yearData === null ? (
+                {!yearReady ||
+                year === null ||
+                (yearlyPoints.length === 0 && cumulativePoints.length === 0) ? (
                   <div className="flex h-72 items-center justify-center font-mono text-sm text-muted-foreground">
                     loading…
                   </div>
                 ) : (
                   <>
-                    <div>
-                      <ChartLabel>total per year</ChartLabel>
-                      <YearlySpendChart
-                        year={year}
-                        points={yearData.yearly}
-                        format={format}
-                        compact={compact}
-                        onPin={onPin}
-                      />
-                    </div>
-                    <div>
-                      <ChartLabel>cumulative spend · {year}</ChartLabel>
-                      <CumulativeChart
-                        year={year}
-                        points={yearData.cumulative}
-                        format={format}
-                        compact={compact}
-                        onPin={onPin}
-                      />
-                    </div>
+                    {yearlyPoints.length > 0 && (
+                      <div>
+                        <ChartLabel>total per year</ChartLabel>
+                        <YearlySpendChart
+                          year={year}
+                          points={yearlyPoints}
+                          format={format}
+                          compact={compact}
+                          onPin={onPin}
+                        />
+                      </div>
+                    )}
+                    {cumulativePoints.length > 0 && (
+                      <div>
+                        <ChartLabel>cumulative spend · {year}</ChartLabel>
+                        <CumulativeChart
+                          year={year}
+                          points={cumulativePoints}
+                          format={format}
+                          compact={compact}
+                          onPin={onPin}
+                        />
+                      </div>
+                    )}
                   </>
                 )}
               </CardContent>
@@ -786,7 +885,7 @@ export function Dashboard({
                     tag={granularity}
                   />
                   <CardDescription>
-                    {currency} · {label}
+                    {currency} · {monthlyPeriod}
                   </CardDescription>
                 </div>
                 <Segmented
@@ -800,28 +899,34 @@ export function Dashboard({
                 />
               </CardHeader>
               <CardContent>
-                {loading || year === null || month === null || monthData === null ? (
-                  <div className="flex h-72 items-center justify-center font-mono text-sm text-muted-foreground">
-                    loading…
-                  </div>
-                ) : granularity === "month" ? (
-                  <MonthlySpendChart
+                {granularity === "month" ? (
+                  month !== null && year !== null && monthReady && monthlyPoints.length > 0 ? (
+                    <MonthlySpendChart
+                      year={year}
+                      months={monthlyPoints}
+                      selectedMonth={month}
+                      format={format}
+                      compact={compact}
+                      onPin={onPin}
+                    />
+                  ) : (
+                    <div className="flex h-72 items-center justify-center font-mono text-sm text-muted-foreground">
+                      loading…
+                    </div>
+                  )
+                ) : month !== null && year !== null && dayReady && dailyPoints.length > 0 ? (
+                  <DailySpendChart
                     year={year}
-                    months={monthData.months}
-                    selectedMonth={month}
+                    month={month}
+                    days={dailyPoints}
                     format={format}
                     compact={compact}
                     onPin={onPin}
                   />
                 ) : (
-                  <DailySpendChart
-                    year={year}
-                    month={month}
-                    days={monthData.days}
-                    format={format}
-                    compact={compact}
-                    onPin={onPin}
-                  />
+                  <div className="flex h-72 items-center justify-center font-mono text-sm text-muted-foreground">
+                    loading…
+                  </div>
                 )}
               </CardContent>
             </Card>
@@ -830,10 +935,10 @@ export function Dashboard({
           <Card className="animate-step-in">
             <CardHeader>
               <EditorialTitle title="categories" tag="spend" />
-              <CardDescription>spend by category · {label}</CardDescription>
+              <CardDescription>spend by category · {categoryPeriod}</CardDescription>
             </CardHeader>
             <CardContent>
-              {loading || summary === null ? (
+              {!donutReady ? (
                 <div className="flex h-72 items-center justify-center font-mono text-sm text-muted-foreground">
                   loading…
                 </div>
