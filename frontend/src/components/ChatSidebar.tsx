@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from "react"
 import { Button } from "@/components/ui/button"
 import { streamChat, type ChatHistoryEntry } from "@/lib/chat"
+import { formatSql, tokenizeSqlForHighlight } from "@/lib/sqlFormat"
 import { cn } from "@/lib/utils"
 import { selectionKey, type ChartUpdate, type Selection } from "@/types"
 
@@ -61,12 +62,49 @@ function SelectionChip({
 }
 
 function SqlChip({ sql }: { sql: string }) {
+  const formatted = formatSql(sql)
+  const tokens = tokenizeSqlForHighlight(formatted)
+  const [copied, setCopied] = useState(false)
+
+  function onCopy() {
+    navigator.clipboard
+      .writeText(sql)
+      .then(() => {
+        setCopied(true)
+        window.setTimeout(() => setCopied(false), 1500)
+      })
+      .catch(() => {})
+  }
+
   return (
-    <div className="mb-1 font-mono text-[11px]">
-      <span className="mr-1 border border-border bg-muted px-1 py-0.5 text-[10px] font-medium uppercase tracking-[0.12em]">
-        run_sql
-      </span>
-      <code className="break-all text-muted-foreground">{sql}</code>
+    <div className="mb-2 overflow-hidden border border-border">
+      <div className="flex items-center justify-between gap-2 border-b border-border bg-muted px-2 py-1">
+        <span className="font-mono text-[10px] font-semibold uppercase tracking-[0.12em]">
+          run_sql
+        </span>
+        <button
+          type="button"
+          onClick={onCopy}
+          className="border border-border bg-background px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-[0.12em] hover:bg-accent"
+        >
+          {copied ? "copied" : "copy"}
+        </button>
+      </div>
+      <pre className="max-w-full overflow-x-auto bg-background p-2 font-mono text-[11px] leading-relaxed">
+        <code className="whitespace-pre">
+          {tokens.map((token, index) =>
+            token.isKeyword ? (
+              <span key={index} className="font-semibold text-foreground">
+                {token.text}
+              </span>
+            ) : (
+              <span key={index} className="text-muted-foreground">
+                {token.text}
+              </span>
+            ),
+          )}
+        </code>
+      </pre>
     </div>
   )
 }
