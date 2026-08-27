@@ -14,6 +14,8 @@ import {
   YAxis,
 } from "recharts"
 
+import { Bot } from "lucide-react"
+
 import { EditorialTitle } from "@/components/EditorialTitle"
 import { Segmented } from "@/components/Segmented"
 import { SankeyDiagram, type SankeyData } from "@/components/SankeyDiagram"
@@ -22,6 +24,18 @@ import { getJson } from "@/lib/api"
 import { MONTH_LABELS, periodLabel, type Currency, type Granularity, type View } from "@/lib/format"
 import { anchorFromClick, cn } from "@/lib/utils"
 import type { Category, ChartUpdate, Selection } from "@/types"
+
+function AiBadge() {
+  return (
+    <div
+      aria-label="AI generated"
+      title="AI generated"
+      className="absolute right-2 top-2 flex size-5 items-center justify-center bg-brand-pink text-white"
+    >
+      <Bot size={12} strokeWidth={2.5} aria-hidden="true" />
+    </div>
+  )
+}
 
 interface Summary {
   year: number
@@ -116,6 +130,29 @@ function buildChatSlices(
   }))
 }
 
+function filterSankeyByCategories(data: SankeyData, allowed: Set<string>): SankeyData {
+  const allowedIds = new Set([...allowed].map((name) => `category:${name}`))
+  const links = data.links.filter((link) => link.kind === "transfer" || allowedIds.has(link.target))
+  if (allowed.size === 0) {
+    return {
+      ...data,
+      nodes: data.nodes.filter((node) => node.column !== 2),
+      links,
+    }
+  }
+  const keptIds = new Set<string>()
+  for (const link of links) {
+    keptIds.add(link.source)
+    keptIds.add(link.target)
+  }
+  const nodes = data.nodes.filter((node) => {
+    if (!keptIds.has(node.id)) return false
+    if (node.column === 2) return allowedIds.has(node.id)
+    return true
+  })
+  return { ...data, nodes, links }
+}
+
 type KpiMetric = "income" | "spend" | "moved"
 
 function KpiCard({
@@ -127,6 +164,7 @@ function KpiCard({
   year,
   month,
   onPin,
+  isAi,
 }: {
   metric: KpiMetric
   value: number
@@ -136,6 +174,7 @@ function KpiCard({
   year: number | null
   month: number | null
   onPin: (selection: Selection, anchor: { x: number; y: number }) => void
+  isAi?: boolean
 }) {
   function pin(event: { clientX?: number; clientY?: number; currentTarget: Element }) {
     onPin(
@@ -152,7 +191,13 @@ function KpiCard({
   }
 
   return (
-    <Card className="animate-step-in border-l-2 border-l-brand-pink">
+    <Card
+      className={cn(
+        "relative animate-step-in border-l-2 border-l-brand-pink",
+        isAi && "!border-brand-pink",
+      )}
+    >
+      {isAi && <AiBadge />}
       <CardContent className="p-6">
         <div className="inline-flex items-stretch gap-0">
           <span className="text-band text-xs font-semibold uppercase tracking-[0.08em]">
@@ -722,7 +767,14 @@ export function Dashboard({
     chat?.categories !== undefined
       ? buildChatSlices(chat.categories, taxonomy)
       : (current?.slices ?? [])
-  const sankey = current?.sankey ?? null
+  const baseSankey = current?.sankey ?? null
+  let sankey: SankeyData | null = baseSankey
+  if (baseSankey !== null && chat !== null) {
+    const allowed = chat.sankey !== undefined ? chat.sankey : chat.categories?.map((c) => c.name)
+    if (allowed !== undefined) {
+      sankey = filterSankeyByCategories(baseSankey, new Set(allowed))
+    }
+  }
   const yearlyPoints =
     chat?.yearly?.map((point) => ({ year: point.year, spend: point.value })) ??
     current?.yearData?.yearly ??
@@ -754,6 +806,17 @@ export function Dashboard({
   const kpiPeriod = chat !== null && chat.kpi !== undefined ? chat.label : label
   const monthlyPeriod = chat !== null && chat.monthly !== undefined ? chat.label : label
   const categoryPeriod = chat !== null && chat.categories !== undefined ? chat.label : label
+
+  // Super thin pink border when the AI has overridden that chart. It clears
+  // as soon as any navbar picker is touched (App clears chartUpdate).
+  const kpiIsAi = chatKpi !== undefined
+  const sankeyIsAi =
+    chat !== null &&
+    baseSankey !== null &&
+    (chat.sankey !== undefined || chat.categories !== undefined)
+  const yearlyIsAi = chat?.yearly !== undefined || chat?.cumulative !== undefined
+  const monthlyIsAi = chat?.monthly !== undefined
+  const categoriesIsAi = chat?.categories !== undefined
 
   return (
     <main className="min-w-0 flex-1 px-4 py-6 sm:px-6 sm:py-8 lg:overflow-y-auto">
@@ -788,6 +851,7 @@ export function Dashboard({
               year={year}
               month={month}
               onPin={onPin}
+              isAi={kpiIsAi}
             />
             <KpiCard
               metric="spend"
@@ -798,6 +862,7 @@ export function Dashboard({
               year={year}
               month={month}
               onPin={onPin}
+              isAi={kpiIsAi}
             />
             <KpiCard
               metric="moved"
@@ -808,12 +873,14 @@ export function Dashboard({
               year={year}
               month={month}
               onPin={onPin}
+              isAi={kpiIsAi}
             />
           </div>
         )}
 
         <div className="grid grid-cols-1 gap-4 sm:gap-6">
-          <Card className="animate-step-in">
+          <Card className={cn("relative animate-step-in", sankeyIsAi && "!border-brand-pink")}>
+            {sankeyIsAi && <AiBadge />}
             <CardHeader>
               <EditorialTitle title="money flow" tag={String(year ?? "")} />
               <CardDescription>
@@ -832,7 +899,8 @@ export function Dashboard({
           </Card>
 
           {view === "year" ? (
-            <Card className="animate-step-in">
+            <Card className={cn("relative animate-step-in", yearlyIsAi && "!border-brand-pink")}>
+              {yearlyIsAi && <AiBadge />}
               <CardHeader>
                 <EditorialTitle title="yearly spend" tag="year" />
                 <CardDescription>
@@ -877,7 +945,8 @@ export function Dashboard({
               </CardContent>
             </Card>
           ) : (
-            <Card className="animate-step-in">
+            <Card className={cn("relative animate-step-in", monthlyIsAi && "!border-brand-pink")}>
+              {monthlyIsAi && <AiBadge />}
               <CardHeader className="flex-row items-start justify-between gap-4">
                 <div className="flex flex-col gap-1.5">
                   <EditorialTitle
@@ -932,7 +1001,8 @@ export function Dashboard({
             </Card>
           )}
 
-          <Card className="animate-step-in">
+          <Card className={cn("relative animate-step-in", categoriesIsAi && "!border-brand-pink")}>
+            {categoriesIsAi && <AiBadge />}
             <CardHeader>
               <EditorialTitle title="categories" tag="spend" />
               <CardDescription>spend by category · {categoryPeriod}</CardDescription>

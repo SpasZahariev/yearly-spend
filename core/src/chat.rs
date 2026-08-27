@@ -40,10 +40,38 @@ every data-related answer in actual query results.";
 const RENDER_TOOL_NAME: &str = "render_dashboard";
 const RENDER_TOOL_DESCRIPTION: &str = "Push numbers you already computed with run_sql \
 onto the live dashboard: KPI cards (income/spend/moved), the monthly spend bar \
-chart, the yearly spend bar chart, the cumulative spend line and the category \
-donut. The user sees the data on the dashboard; call it when your answer covers \
+chart, the yearly spend bar chart, the cumulative spend line, the category \
+donut and the money-flow sankey, and also drive the navbar pickers (year, month, \
+view, currency) so the dashboard shows the period and currency the user asked \
+about. The user sees the data on the dashboard; call it when your answer covers \
 data one of these charts can show, then mention in your reply that the \
 dashboard now shows it.";
+
+/// One turn of the visible chat history. The frontend sends the whole
+/// conversation (oldest first, excluding the current user message) so the
+/// model can answer follow-ups. Tool traces are not persisted; only the
+/// rendered text the user saw is carried.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChatHistoryEntry {
+    pub role: String,
+    pub content: String,
+}
+
+impl ChatHistoryEntry {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.role == "user" || self.role == "assistant",
+            "history role must be 'user' or 'assistant'"
+        );
+        let trimmed = self.content.trim();
+        anyhow::ensure!(!trimmed.is_empty(), "history content is empty");
+        anyhow::ensure!(
+            trimmed.chars().count() <= 20_000,
+            "history content must be 1..20000 chars"
+        );
+        Ok(())
+    }
+}
 
 /// Which chart a pinned selection chip came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +140,7 @@ impl Selection {
 
 /// One SSE event streamed back to the client.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum ChatEvent {
     /// A chunk of the assistant's visible reply.
     Token(String),
@@ -179,7 +208,8 @@ pub struct KpiValues {
 
 /// Chart data pushed to the dashboard by the `render_dashboard` tool.
 /// All amounts are positive CHF magnitudes; the frontend merges them over
-/// the standard API data for the matching year.
+/// the standard API data for the matching year and drives navbar pickers
+/// (year, month, view, currency) plus the sankey category filter.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DashboardUpdate {
     pub year: i32,
@@ -194,6 +224,23 @@ pub struct DashboardUpdate {
     pub cumulative: Option<Vec<MonthPoint>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub categories: Option<Vec<CategoryPoint>>,
+    /// Target display currency for the navbar (CHF, USD, EUR). When set the
+    /// frontend switches the currency picker; the numeric payload stays in CHF
+    /// and the client converts for display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+    /// 1-12 month the data is scoped to. When set the frontend switches to
+    /// that month; omit for year-scoped payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub month: Option<u8>,
+    /// "month" or "year" – drives the navbar view toggle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<String>,
+    /// Subset of category names to show as outflows in the money-flow sankey.
+    /// When omitted the sankey mirrors `categories` if that is present;
+    /// otherwise it shows all categories. Names must be from the categories table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sankey: Option<Vec<String>>,
 }
 
 impl DashboardUpdate {
@@ -214,10 +261,11 @@ impl DashboardUpdate {
             !self.yearly.as_deref().unwrap_or_default().is_empty(),
             !self.cumulative.as_deref().unwrap_or_default().is_empty(),
             !self.categories.as_deref().unwrap_or_default().is_empty(),
+            !self.sankey.as_deref().unwrap_or_default().is_empty(),
         ];
         if !section_present.into_iter().any(|present| present) {
             return Err(
-                "at least one chart section (kpi, monthly, yearly, cumulative, categories) is required".into(),
+                "at least one chart section (kpi, monthly, yearly, cumulative, categories, sankey) is required".into(),
             );
         }
         if let Some(kpi) = &self.kpi {
@@ -292,6 +340,41 @@ impl DashboardUpdate {
                 }
             }
         }
+        if let Some(currency) = &self.currency {
+            let normalized = currency.trim().to_ascii_uppercase();
+            if !["CHF", "USD", "EUR"].contains(&normalized.as_str()) {
+                return Err("currency must be CHF, USD or EUR".into());
+            }
+        }
+        if let Some(month) = self.month
+            && !(1..=12).contains(&month)
+        {
+            return Err("month must be 1-12".into());
+        }
+        if let Some(view) = &self.view
+            && view != "month"
+            && view != "year"
+        {
+            return Err("view must be 'month' or 'year'".into());
+        }
+        if let Some(sankey) = &self.sankey {
+            if sankey.len() > 18 {
+                return Err("sankey holds at most 18 entries".into());
+            }
+            let mut seen: HashSet<&str> = HashSet::new();
+            for name in sankey {
+                let trimmed = name.trim();
+                if trimmed.is_empty() || !category_names.contains(trimmed) {
+                    return Err(format!(
+                        "unknown sankey category '{}'; use names from the categories table",
+                        name
+                    ));
+                }
+                if !seen.insert(trimmed) {
+                    return Err(format!("duplicate sankey category '{}'", trimmed));
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -331,21 +414,29 @@ impl Chat {
     }
 
     /// Run the chat loop for one user message, streaming events to `tx`.
-    /// Terminates with `ChatEvent::Error` on failure or after `MAX_ROUNDS`
-    /// tool round trips; on success it simply ends when the model stops
-    /// calling tools.
+    /// `history` is the prior visible conversation (oldest first) and is
+    /// replayed verbatim so follow-ups have context. Terminates with
+    /// `ChatEvent::Error` on failure or after `MAX_ROUNDS` tool round trips;
+    /// on success it simply ends when the model stops calling tools.
     pub async fn run(
         &self,
         message: &str,
         selections: Vec<Selection>,
+        history: Vec<ChatHistoryEntry>,
         tx: UnboundedSender<ChatEvent>,
     ) {
         let system = build_system_prompt(selections);
         let mut rounds: Vec<Round> = Vec::new();
         for _ in 0..MAX_ROUNDS {
             let outcome = match self.provider {
-                LlmProvider::Local => self.stream_local(&system, message, &rounds, &tx).await,
-                LlmProvider::Gemini => self.stream_gemini(&system, message, &rounds, &tx).await,
+                LlmProvider::Local => {
+                    self.stream_local(&system, &history, message, &rounds, &tx)
+                        .await
+                }
+                LlmProvider::Gemini => {
+                    self.stream_gemini(&system, &history, message, &rounds, &tx)
+                        .await
+                }
             };
             let outcome = match outcome {
                 Ok(outcome) => outcome,
@@ -434,13 +525,14 @@ impl Chat {
     async fn stream_local(
         &self,
         system: &str,
+        history: &[ChatHistoryEntry],
         user: &str,
         rounds: &[Round],
         tx: &UnboundedSender<ChatEvent>,
     ) -> anyhow::Result<StreamOutcome> {
         let body = serde_json::json!({
             "model": self.local_model,
-            "messages": local_messages(system, user, rounds),
+            "messages": local_messages(system, history, user, rounds),
             "temperature": 0.2,
             "stream": true,
             "tools": [tool_spec_local(), render_tool_spec_local()],
@@ -526,6 +618,7 @@ impl Chat {
     async fn stream_gemini(
         &self,
         system: &str,
+        history: &[ChatHistoryEntry],
         user: &str,
         rounds: &[Round],
         tx: &UnboundedSender<ChatEvent>,
@@ -535,7 +628,7 @@ impl Chat {
             "GEMINI_API_KEY is not set for provider 'gemini'"
         );
         let body = serde_json::json!({
-            "contents": gemini_contents(user, rounds),
+            "contents": gemini_contents(history, user, rounds),
             "system_instruction": { "parts": [{ "text": system }] },
             "tools": [{
                 "function_declarations": [tool_spec_gemini(), render_tool_spec_gemini()]
@@ -1087,6 +1180,27 @@ fn render_tool_parameters() -> serde_json::Value {
                     },
                     "required": ["name", "value"]
                 }
+            },
+            "currency": {
+                "type": "string",
+                "enum": ["CHF", "USD", "EUR"],
+                "description": "Display currency for the navbar; switches the currency picker. Values stay in CHF."
+            },
+            "month": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 12,
+                "description": "Month (1-12) the data is scoped to; drives the navbar month picker and sankey period. Omit for year scope."
+            },
+            "view": {
+                "type": "string",
+                "enum": ["month", "year"],
+                "description": "Navbar view toggle; 'month' shows monthly/daily charts, 'year' shows yearly/cumulative."
+            },
+            "sankey": {
+                "type": "array",
+                "description": "Category names to show as outflows in the money-flow sankey. When omitted the sankey mirrors categories; use names from the categories table.",
+                "items": { "type": "string" }
             }
         },
         "required": ["year", "label"]
@@ -1112,13 +1226,24 @@ fn render_tool_spec_gemini() -> serde_json::Value {
     })
 }
 
-/// OpenAI-compatible wire messages: system + user, then per round an
-/// assistant message with tool_calls and one `tool` message per result.
-fn local_messages(system: &str, user: &str, rounds: &[Round]) -> Vec<serde_json::Value> {
-    let mut out = vec![
-        serde_json::json!({ "role": "system", "content": system }),
-        serde_json::json!({ "role": "user", "content": user }),
-    ];
+/// OpenAI-compatible wire messages: system + history + user, then per round
+/// an assistant message with tool_calls and one `tool` message per result.
+fn local_messages(
+    system: &str,
+    history: &[ChatHistoryEntry],
+    user: &str,
+    rounds: &[Round],
+) -> Vec<serde_json::Value> {
+    let mut out = vec![serde_json::json!({ "role": "system", "content": system })];
+    for entry in history {
+        let role = if entry.role == "assistant" {
+            "assistant"
+        } else {
+            "user"
+        };
+        out.push(serde_json::json!({ "role": role, "content": entry.content }));
+    }
+    out.push(serde_json::json!({ "role": "user", "content": user }));
     for round in rounds {
         out.push(serde_json::json!({
             "role": "assistant",
@@ -1149,11 +1274,23 @@ fn local_messages(system: &str, user: &str, rounds: &[Round]) -> Vec<serde_json:
     out
 }
 
-/// Gemini wire contents: user first, then per round a `model` message with
-/// text and function_call parts followed by one `user` message with
-/// function_response parts.
-fn gemini_contents(user: &str, rounds: &[Round]) -> Vec<serde_json::Value> {
-    let mut out = vec![serde_json::json!({ "role": "user", "parts": [{ "text": user }] })];
+/// Gemini wire contents: history + user first, then per round a `model`
+/// message with text and function_call parts followed by one `user` message
+/// with function_response parts.
+fn gemini_contents(
+    history: &[ChatHistoryEntry],
+    user: &str,
+    rounds: &[Round],
+) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for entry in history {
+        if entry.role == "assistant" {
+            out.push(serde_json::json!({ "role": "model", "parts": [{ "text": entry.content }] }));
+        } else {
+            out.push(serde_json::json!({ "role": "user", "parts": [{ "text": entry.content }] }));
+        }
+    }
+    out.push(serde_json::json!({ "role": "user", "parts": [{ "text": user }] }));
     for round in rounds {
         let mut parts = Vec::new();
         if !round.assistant_text.is_empty() {
@@ -1214,12 +1351,13 @@ data-related claim in actual query results; never invent numbers. Make at most a
 couple of calls, then answer.
 - render_dashboard: pushes computed numbers onto the live dashboard charts: KPI \
 cards (kpi), the monthly spend bar chart (monthly), the yearly spend bar chart \
-(yearly), the cumulative spend line (cumulative) and the category donut \
-(categories). When the user's question is about data one of these charts can \
-show, compute the values with run_sql, call render_dashboard so the user sees \
-the answer on screen, and briefly say so in your reply. Do not call it for \
-questions the dashboard cannot show (lists of individual transactions, single \
-facts, explanations).
+(yearly), the cumulative spend line (cumulative), the category donut \
+(categories) and the money-flow sankey (sankey), and drives the navbar pickers \
+(year, month, view, currency). When the user's question is about data one of \
+these charts can show, compute the values with run_sql, call render_dashboard \
+so the user sees the answer on screen, and briefly say so in your reply. Do not \
+call it for questions the dashboard cannot show (lists of individual \
+transactions, single facts, explanations).
 
 render_dashboard rules:
 - year is the year the data covers; label is a short period label like '2024' \
@@ -1232,6 +1370,21 @@ question implies (year, month, category, account, source).
 one of those chart pairs at a time. You may combine charts with kpi and \
 categories in a single call.
 - Category names must match the categories table exactly; query it if unsure.
+- Navbar: set `year` to the year the user asked about; set `month` (1-12) when \
+the question is month-scoped or implies a specific month, and set `view` to \
+'month' for month-scoped and 'year' for year-scoped payloads; the frontend \
+switches the pickers. For 'top N' queries, report in the period the user asked \
+about (default to the selected year when none is mentioned) and set the pickers \
+accordingly. Also set `currency` to CHF/EUR/USD when the user asks in a \
+specific currency (case-insensitive) or when the data implies a different \
+display currency; the payload stays in CHF and the client converts.
+- Sankey: the money-flow card always reflects the current year/month. Its \
+category outflows normally mirror `categories` when you provide them; for a \
+'top N' question, provide exactly N categories and the sankey will show exactly \
+N outflows. Use `sankey` to override: a list of category names to show as \
+outflows (must be from the taxonomy). If the question scopes to a month, also \
+set `month` and `view='month'` so the sankey fetches the correct period before \
+filtering.
 
 Style: concise plain prose, exact CHF amounts (two decimals), short lists or tables \
 where they help, and answer the user's question directly.";
@@ -1450,6 +1603,10 @@ mod tests {
                 name: "food".into(),
                 value: 250.0,
             }]),
+            currency: None,
+            month: None,
+            view: None,
+            sankey: None,
         }
     }
 
@@ -1599,6 +1756,10 @@ mod tests {
             yearly: None,
             cumulative: None,
             categories: None,
+            currency: None,
+            month: None,
+            view: None,
+            sankey: None,
         };
         assert_eq!(
             serde_json::to_value(&update).unwrap(),

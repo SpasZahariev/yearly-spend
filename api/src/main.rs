@@ -13,7 +13,7 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tower_http::services::{ServeDir, ServeFile};
 
-use spend_core::chat::{Chat, ChatEvent, Selection};
+use spend_core::chat::{Chat, ChatEvent, ChatHistoryEntry, Selection};
 
 #[derive(Clone)]
 struct AppState {
@@ -359,15 +359,19 @@ async fn fx_spot(state: State<Arc<AppState>>, query: Query<FxQuery>) -> Response
 }
 
 /// Body for `POST /api/chat`. `message` is required; pinned chart selections
-/// may travel with it as context.
+/// may travel with it as context. `history` is the prior visible conversation
+/// (oldest first) and is replayed so follow-ups have context.
 #[derive(Debug, Deserialize)]
 struct ChatBody {
     message: String,
     #[serde(default)]
     selections: Vec<Selection>,
+    #[serde(default)]
+    history: Vec<ChatHistoryEntry>,
 }
 
 const MAX_MESSAGE_CHARS: usize = 20_000;
+const MAX_HISTORY_ITEMS: usize = 20;
 
 /// `POST /api/chat`: streams the assistant reply as SSE. Event kinds:
 /// default (`data: <token>`), `tool` (`data: {"sql": ...}`), `chart`
@@ -382,6 +386,18 @@ async fn chat(state: State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Respon
         )
             .into_response();
     }
+    if body.history.len() > MAX_HISTORY_ITEMS {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("history must have at most {MAX_HISTORY_ITEMS} items"),
+        )
+            .into_response();
+    }
+    for entry in &body.history {
+        if let Err(err) = entry.validate() {
+            return (StatusCode::BAD_REQUEST, err.to_string()).into_response();
+        }
+    }
     for selection in &body.selections {
         if let Err(err) = selection.validate() {
             return (StatusCode::BAD_REQUEST, err.to_string()).into_response();
@@ -392,8 +408,9 @@ async fn chat(state: State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Respon
     tokio::spawn(async move {
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(180), {
             let selections = body.selections;
+            let history = body.history;
             async {
-                chat.run(&message, selections, tx.clone()).await;
+                chat.run(&message, selections, history, tx.clone()).await;
             }
         })
         .await;

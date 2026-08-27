@@ -1,11 +1,18 @@
 import type { ChartUpdate, Selection } from "@/types"
 
+export interface ChatHistoryEntry {
+  role: "user" | "assistant"
+  content: string
+}
+
 /**
  * Streams one chat request over SSE. `POST /api/chat` answers with a text
  * event stream: bare `data:` lines are reply tokens, `event: tool` lines
  * carry `{"sql": ...}` (the read-only tool the model invoked), `event: chart`
  * lines carry a dashboard update (the `render_dashboard` tool the model
  * invoked), and `event: error` lines terminate with an error message.
+ * `history` is the prior visible conversation (oldest first) replayed so
+ * follow-ups have context.
  */
 export interface ChatCallbacks {
   onToken: (text: string) => void
@@ -17,13 +24,14 @@ export interface ChatCallbacks {
 export async function streamChat(
   message: string,
   selections: Selection[],
+  history: ChatHistoryEntry[],
   callbacks: ChatCallbacks,
   signal: AbortSignal,
 ): Promise<void> {
   const res = await fetch("/api/chat", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ message, selections }),
+    body: JSON.stringify({ message, selections, history }),
     signal,
   })
   if (!res.ok || res.body === null) {

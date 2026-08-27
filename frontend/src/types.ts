@@ -51,6 +51,14 @@ export interface ChartUpdate {
   yearly?: { year: number; value: number }[]
   cumulative?: { month: number; value: number }[]
   categories?: { name: string; value: number }[]
+  /** Target display currency; when set the navbar currency picker switches. */
+  currency?: "CHF" | "USD" | "EUR"
+  /** 1-12 month the data is scoped to; when set the navbar month picker switches. */
+  month?: number | null
+  /** Navbar view toggle. */
+  view?: "month" | "year"
+  /** Category names to show as outflows in the money-flow sankey. */
+  sankey?: string[]
 }
 
 export interface Transaction {

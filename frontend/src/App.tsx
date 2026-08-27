@@ -286,15 +286,51 @@ export default function App() {
     setMonth(defaultMonthFor(next, periods))
   }
 
+  // User-initiated navbar changes dismiss the AI overlay so charts revert to
+  // the live DB data. AI-driven updates via applyChartUpdate keep the overlay.
+  function handleCurrencyChange(next: Currency) {
+    setChartUpdate(null)
+    setCurrency(next)
+  }
+
+  function handleViewChange(next: View) {
+    setChartUpdate(null)
+    setView(next)
+  }
+
+  function handleYearChange(next: number) {
+    setChartUpdate(null)
+    selectYear(next)
+  }
+
+  function handleMonthChange(next: number) {
+    setChartUpdate(null)
+    setMonth(next)
+  }
+
   function applyChartUpdate(update: ChartUpdate) {
     setChartUpdate(update)
-    // Switch to the view the override can render in: yearly/cumulative data
-    // lives in the year view, monthly data in the month view.
-    if (update.yearly !== undefined || update.cumulative !== undefined) setView("year")
-    else if (update.monthly !== undefined) setView("month")
+    if (update.currency !== undefined) {
+      const cur = update.currency.toUpperCase() as Currency
+      if ((CURRENCIES as readonly string[]).includes(cur)) setCurrency(cur)
+    }
+    if (update.view !== undefined) {
+      setView(update.view)
+    } else if (update.yearly !== undefined || update.cumulative !== undefined) {
+      setView("year")
+    } else if (update.monthly !== undefined) {
+      setView("month")
+    } else if (update.month !== undefined && update.month !== null) {
+      setView("month")
+    }
     if (years.includes(update.year)) {
       setYear(update.year)
-      setMonth(defaultMonthFor(update.year, periods))
+      if (update.month !== undefined) {
+        if (update.month !== null) setMonth(update.month)
+        // null month means year scope - keep default month for data fetches but view stays year
+      } else {
+        setMonth(defaultMonthFor(update.year, periods))
+      }
     }
   }
 
@@ -334,7 +370,7 @@ export default function App() {
             <Segmented
               options={CURRENCIES.map((code) => ({ value: code, label: code }))}
               value={currency}
-              onChange={setCurrency}
+              onChange={handleCurrencyChange}
             />
             {route === "dashboard" && (
               <Segmented
@@ -343,14 +379,14 @@ export default function App() {
                   { value: "year", label: "year" },
                 ]}
                 value={view}
-                onChange={setView}
+                onChange={handleViewChange}
               />
             )}
             {years.length > 0 && (
               <Picker
                 value={year ?? years[0]}
                 options={years.map((option) => ({ value: option, label: String(option) }))}
-                onChange={selectYear}
+                onChange={handleYearChange}
                 label="year"
                 className="w-[90px] shrink-0"
               />
@@ -364,7 +400,7 @@ export default function App() {
                       value: index + 1,
                       label: name,
                     }))}
-                    onChange={setMonth}
+                    onChange={handleMonthChange}
                     label="month"
                     className="w-full"
                   />

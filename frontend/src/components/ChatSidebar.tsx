@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from "react"
 import { Button } from "@/components/ui/button"
-import { streamChat } from "@/lib/chat"
+import { streamChat, type ChatHistoryEntry } from "@/lib/chat"
 import { cn } from "@/lib/utils"
 import { selectionKey, type ChartUpdate, type Selection } from "@/types"
 
@@ -454,6 +454,18 @@ export function ChatSidebar({
   async function send(nextMessage = draft) {
     const message = nextMessage.trim()
     if (message === "" || busy) return
+    // Capture prior conversation for the request before we append the new turn.
+    const history: ChatHistoryEntry[] = items
+      .filter(
+        (item) =>
+          item.text.trim() !== "" &&
+          !(item.role === "assistant" && (item.pending || item.error !== null)),
+      )
+      .map((item) => ({
+        role: item.role as "user" | "assistant",
+        content: item.text.trim().slice(0, 20_000),
+      }))
+      .slice(-20)
     setDraft("")
     const userItem: ChatItem = { id: nextId(), role: "user", text: message }
     const assistantId = nextId()
@@ -477,6 +489,7 @@ export function ChatSidebar({
       await streamChat(
         message,
         selections,
+        history,
         {
           onToken: (text) =>
             patchAssistant(assistantId, (item) => ({ ...item, text: item.text + text })),
