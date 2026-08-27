@@ -2,8 +2,8 @@
 
 A personal finance dashboard I built to track my own spending. It ingests raw CSV exports from Neon, Revolut, and Swisscard (semicolon and comma formats), normalizes every amount to CHF using monthly FX rates from Frankfurter, and categorizes each transaction with an LLM into a fixed 18-category taxonomy. The dashboard itself is fully local and pixel-styled: year and month views, multi-currency display, a Sankey diagram of the money flow, and a chat inspector that can run read-only SQL against the DuckDB file and push the results back onto the charts.
 
-![demo](images/demo.gif)
-*Demo GIF: dashboard, AI chat, and inline transaction editing (1920x1080). I will replace this placeholder with a recorded walkthrough.*
+![demo](images/gifs/demo.gif)
+*Demo: dashboard, AI chat, and inline transaction editing (1920x1080).*
 
 ## Screenshots
 
