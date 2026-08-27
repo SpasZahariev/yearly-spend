@@ -20,7 +20,7 @@ import {
 import { cn } from "@/lib/utils"
 import { Dashboard } from "@/pages/Dashboard"
 import { TransactionsPage } from "@/pages/Transactions"
-import { selectionKey, type Category, type Selection } from "@/types"
+import { selectionKey, type Category, type ChartUpdate, type Selection } from "@/types"
 
 interface Account {
   id: number
@@ -181,6 +181,9 @@ export default function App() {
   const [currency, setCurrency] = useState<Currency>("CHF")
   const [fx, setFx] = useState<Partial<Record<Currency, FxState>>>({})
   const [selections, setSelections] = useState<Selection[]>([])
+  // Chart data pushed by the chat's render_dashboard tool. It belongs to
+  // one year; the dashboard only shows it while that year is selected.
+  const [chartUpdate, setChartUpdate] = useState<ChartUpdate | null>(null)
   const [chatOpen, setChatOpen] = useState(true)
   const [pendingSelection, setPendingSelection] = useState<PendingSelection | null>(null)
   const fxRequests = useRef(new Map<Currency, Promise<void>>())
@@ -283,6 +286,57 @@ export default function App() {
     setMonth(defaultMonthFor(next, periods))
   }
 
+  // User-initiated navbar changes dismiss the AI overlay so charts revert to
+  // the live DB data. AI-driven updates via applyChartUpdate keep the overlay.
+  function handleCurrencyChange(next: Currency) {
+    setChartUpdate(null)
+    setCurrency(next)
+  }
+
+  function handleViewChange(next: View) {
+    setChartUpdate(null)
+    setView(next)
+  }
+
+  function handleYearChange(next: number) {
+    setChartUpdate(null)
+    selectYear(next)
+  }
+
+  function handleMonthChange(next: number) {
+    setChartUpdate(null)
+    setMonth(next)
+  }
+
+  function applyChartUpdate(update: ChartUpdate) {
+    setChartUpdate(update)
+    if (update.currency !== undefined) {
+      const cur = update.currency.toUpperCase() as Currency
+      if ((CURRENCIES as readonly string[]).includes(cur)) setCurrency(cur)
+    }
+    if (update.view !== undefined) {
+      setView(update.view)
+    } else if (update.yearly !== undefined || update.cumulative !== undefined) {
+      setView("year")
+    } else if (update.monthly !== undefined) {
+      setView("month")
+    } else if (update.month !== undefined && update.month !== null) {
+      setView("month")
+    }
+    if (years.includes(update.year)) {
+      setYear(update.year)
+      if (update.month !== undefined) {
+        if (update.month !== null) setMonth(update.month)
+        // null month means year scope - keep default month for data fetches but view stays year
+      } else {
+        setMonth(defaultMonthFor(update.year, periods))
+      }
+    }
+  }
+
+  const activeChartUpdate =
+    chartUpdate !== null && year !== null && chartUpdate.year === year ? chartUpdate : null
+
   const fxReady = currency === "CHF" || fx[currency] !== undefined
   const rate = fx[currency]?.rate ?? 1
   // CHF values come straight from the API; other currencies are converted
@@ -316,7 +370,7 @@ export default function App() {
             <Segmented
               options={CURRENCIES.map((code) => ({ value: code, label: code }))}
               value={currency}
-              onChange={setCurrency}
+              onChange={handleCurrencyChange}
             />
             {route === "dashboard" && (
               <Segmented
@@ -325,14 +379,14 @@ export default function App() {
                   { value: "year", label: "year" },
                 ]}
                 value={view}
-                onChange={setView}
+                onChange={handleViewChange}
               />
             )}
             {years.length > 0 && (
               <Picker
                 value={year ?? years[0]}
                 options={years.map((option) => ({ value: option, label: String(option) }))}
-                onChange={selectYear}
+                onChange={handleYearChange}
                 label="year"
                 className="w-[90px] shrink-0"
               />
@@ -346,7 +400,7 @@ export default function App() {
                       value: index + 1,
                       label: name,
                     }))}
-                    onChange={setMonth}
+                    onChange={handleMonthChange}
                     label="month"
                     className="w-full"
                   />
@@ -394,6 +448,9 @@ export default function App() {
             compact={compact}
             onPin={requestPin}
             reportError={setError}
+            chartUpdate={activeChartUpdate}
+            onClearChartUpdate={() => setChartUpdate(null)}
+            taxonomy={taxonomy}
           />
         )}
         {route === "dashboard" && (
@@ -402,6 +459,7 @@ export default function App() {
             selections={selections}
             onUnpin={unpinSelection}
             onClearSelections={() => setSelections([])}
+            onChart={applyChartUpdate}
             format={format}
           />
         )}

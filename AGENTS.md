@@ -26,9 +26,11 @@ core/        spend-core crate, shared by ingest and api
   src/config.rs    .env loading, LLM provider selection
   src/fx.rs        Frankfurter client: cached_rate (fx_rates table) + monthly average
   src/llm.rs       OpenAI-compatible chat client (local llama-server or Gemini)
-  src/chat.rs      Chat tool loop: single run_sql tool (SELECT-only via
-                   sqlparser DuckDB dialect + lexical CTE-tail guard, read-only
-                   connection, 100-row / 8-round caps), local + Gemini SSE
+  src/chat.rs      Chat tool loop: run_sql (SELECT-only via sqlparser DuckDB
+                   dialect + lexical CTE-tail guard, read-only connection,
+                   100-row / 8-round caps) and render_dashboard (validates a
+                   chart payload against the taxonomy and shape rules, streams
+                   it to the client as a `chart` event), local + Gemini SSE
                    streaming, pinned selection context in the system prompt
   src/queries.rs   Read-only year-scoped queries: summary, monthly_spend,
                    category_breakdown, meta, list_transactions/get_transaction;
@@ -112,11 +114,17 @@ data/        spend.duckdb lives here (gitignored, created on first run)
   label, value, year) in the right-side inspector; chips live in per-tab React
   state and are never persisted (reload -> empty sidebar). `POST /api/chat`
   takes `{message, selections}` and answers `text/event-stream`: bare `data:`
-  frames are reply tokens, `event: tool` carries `{"sql": ...}`, `event: error`
-  terminates with a message. The model's only tool is `run_sql`; SQL must parse
-  as a single SELECT (sqlparser DuckDB dialect + lexical check that a WITH
-  tail is SELECT/VALUES, since sqlparser parses `WITH ... INSERT` as a query),
-  and runs on a short-lived read-only DuckDB connection. The system prompt
+  frames are reply tokens, `event: tool` carries `{"sql": ...}`, `event: chart`
+  carries a validated dashboard update, `event: error` terminates with a
+  message. The model has two tools: `run_sql` (must parse as a single SELECT
+  - sqlparser DuckDB dialect + lexical check that a WITH tail is SELECT/VALUES,
+  since sqlparser parses `WITH ... INSERT` as a query - and runs on a
+  short-lived read-only DuckDB connection) and `render_dashboard` (pushes
+  computed numbers onto the dashboard: KPI cards, monthly/yearly bars,
+  cumulative line, category donut; validated against the taxonomy and per-chart
+  shape rules, streamed as `event: chart`). The frontend overlays a `chart`
+  payload on the dashboard for its matching year (a banner offers "clear"),
+  switching the view to the one the payload can render in. The system prompt
   documents the schema and tells the model the dashboard's spend formula
   (`sum(-amount_chf) FILTER (WHERE kind = 'spend')`; refund rows stored
   positive net against spend) so its totals match the rendered numbers.

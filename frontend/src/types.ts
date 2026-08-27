@@ -37,6 +37,30 @@ export interface Category {
   color: string
 }
 
+/**
+ * Dashboard chart data pushed by the chat's `render_dashboard` tool
+ * (streamed as `event: chart`). All amounts are positive CHF magnitudes,
+ * before client-side currency conversion.
+ */
+export interface ChartUpdate {
+  year: number
+  /** Short label of the period the data covers, e.g. "2024" or "2024-03". */
+  label: string
+  kpi?: { income: number; spend: number; moved: number }
+  monthly?: { month: number; value: number }[]
+  yearly?: { year: number; value: number }[]
+  cumulative?: { month: number; value: number }[]
+  categories?: { name: string; value: number }[]
+  /** Target display currency; when set the navbar currency picker switches. */
+  currency?: "CHF" | "USD" | "EUR"
+  /** 1-12 month the data is scoped to; when set the navbar month picker switches. */
+  month?: number | null
+  /** Navbar view toggle. */
+  view?: "month" | "year"
+  /** Category names to show as outflows in the money-flow sankey. */
+  sankey?: string[]
+}
+
 export interface Transaction {
   id: number
   dt: string

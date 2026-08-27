@@ -13,7 +13,7 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tower_http::services::{ServeDir, ServeFile};
 
-use spend_core::chat::{Chat, ChatEvent, Selection};
+use spend_core::chat::{Chat, ChatEvent, ChatHistoryEntry, Selection};
 
 #[derive(Clone)]
 struct AppState {
@@ -359,19 +359,24 @@ async fn fx_spot(state: State<Arc<AppState>>, query: Query<FxQuery>) -> Response
 }
 
 /// Body for `POST /api/chat`. `message` is required; pinned chart selections
-/// may travel with it as context.
+/// may travel with it as context. `history` is the prior visible conversation
+/// (oldest first) and is replayed so follow-ups have context.
 #[derive(Debug, Deserialize)]
 struct ChatBody {
     message: String,
     #[serde(default)]
     selections: Vec<Selection>,
+    #[serde(default)]
+    history: Vec<ChatHistoryEntry>,
 }
 
 const MAX_MESSAGE_CHARS: usize = 20_000;
+const MAX_HISTORY_ITEMS: usize = 20;
 
 /// `POST /api/chat`: streams the assistant reply as SSE. Event kinds:
-/// default (`data: <token>`), `tool` (`data: {"sql": ...}`) and `error`
-/// (`data: <message>`). Nothing about the conversation is persisted.
+/// default (`data: <token>`), `tool` (`data: {"sql": ...}`), `chart`
+/// (`data: <dashboard update JSON>`) and `error` (`data: <message>`).
+/// Nothing about the conversation is persisted.
 async fn chat(state: State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Response {
     let message = body.message.trim().to_string();
     if message.is_empty() || message.chars().count() > MAX_MESSAGE_CHARS {
@@ -380,6 +385,18 @@ async fn chat(state: State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Respon
             format!("message must be 1..{MAX_MESSAGE_CHARS} chars"),
         )
             .into_response();
+    }
+    if body.history.len() > MAX_HISTORY_ITEMS {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("history must have at most {MAX_HISTORY_ITEMS} items"),
+        )
+            .into_response();
+    }
+    for entry in &body.history {
+        if let Err(err) = entry.validate() {
+            return (StatusCode::BAD_REQUEST, err.to_string()).into_response();
+        }
     }
     for selection in &body.selections {
         if let Err(err) = selection.validate() {
@@ -391,8 +408,9 @@ async fn chat(state: State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Respon
     tokio::spawn(async move {
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(180), {
             let selections = body.selections;
+            let history = body.history;
             async {
-                chat.run(&message, selections, tx.clone()).await;
+                chat.run(&message, selections, history, tx.clone()).await;
             }
         })
         .await;
@@ -406,6 +424,9 @@ async fn chat(state: State<Arc<AppState>>, Json(body): Json<ChatBody>) -> Respon
             ChatEvent::ToolCall { sql } => Event::default()
                 .event("tool")
                 .data(serde_json::json!({ "sql": sql }).to_string()),
+            ChatEvent::ChartUpdate(update) => Event::default()
+                .event("chart")
+                .data(serde_json::to_string(&update).unwrap_or_default()),
             ChatEvent::Error(message) => Event::default().event("error").data(message),
         };
         Ok::<_, std::io::Error>(event)
@@ -1281,6 +1302,14 @@ mod tests {
         )
     }
 
+    /// One OpenAI-style SSE frame stream: a tool call to `render_dashboard`.
+    fn openai_render_sse(args: &serde_json::Value) -> String {
+        let args_escaped = serde_json::json!(args.to_string()).to_string();
+        format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_1\",\"function\":{{\"name\":\"render_dashboard\",\"arguments\":{args_escaped}}}}}]}}}}]}}\n\ndata: [DONE]\n\n"
+        )
+    }
+
     /// One OpenAI-style SSE frame stream: visible reply text.
     fn openai_text_sse(text: &str) -> String {
         let text_escaped = serde_json::json!(text).to_string();
@@ -1294,6 +1323,13 @@ mod tests {
         let args = serde_json::json!({ "sql": sql }).to_string();
         format!(
             "data: {{\"candidates\":[{{\"content\":{{\"parts\":[{{\"function_call\":{{\"name\":\"run_sql\",\"args\":{args}}}}}]}}}}]}}\n\n"
+        )
+    }
+
+    /// One Gemini-style SSE frame stream: a `render_dashboard` function_call.
+    fn gemini_render_sse(args: &serde_json::Value) -> String {
+        format!(
+            "data: {{\"candidates\":[{{\"content\":{{\"parts\":[{{\"function_call\":{{\"name\":\"render_dashboard\",\"args\":{args}}}}}]}}}}]}}\n\n"
         )
     }
 
@@ -1483,6 +1519,130 @@ mod tests {
             "function response missing: {log:?}"
         );
         drop(log);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn chat_streams_chart_update_for_render_dashboard() {
+        let (dir, db) = temp_db();
+        seed_transactions(&db);
+        let args = serde_json::json!({
+            "year": 2025,
+            "label": "2025",
+            "kpi": { "income": 3000.0, "spend": 425.75, "moved": 50.0 },
+            "monthly": [{ "month": 1, "value": 225.25 }],
+            "categories": [{ "name": "food", "value": 175.25 }]
+        });
+        let (base, hits, log) = mock_llm_server(vec![
+            openai_render_sse(&args),
+            openai_text_sse("The dashboard now shows 2025."),
+        ])
+        .await;
+        let chat = chat_at(db.clone(), spend_core::config::LlmProvider::Local, base);
+        let app = app(AppState {
+            db_path: db,
+            fx: spend_core::fx::Fx::new("http://127.0.0.1:1"),
+            chat,
+        });
+        let (status, sse) = post_chat(&app, &serde_json::json!({ "message": "Show 2025" })).await;
+        assert_eq!(status, StatusCode::OK, "body: {sse}");
+        // The chart event carries the validated payload as JSON.
+        assert!(sse.contains("event: chart"), "body: {sse}");
+        assert!(sse.contains("\"label\":\"2025\""), "body: {sse}");
+        assert!(sse.contains("\"value\":175.25"), "body: {sse}");
+        assert!(sse.contains("The dashboard now shows 2025."), "body: {sse}");
+        // No generic tool frame for render_dashboard (it has no SQL to show).
+        assert!(!sse.contains("event: tool"), "body: {sse}");
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "expected exactly two model round trips"
+        );
+        let log = log.lock().unwrap();
+        // The tool result fed back to the model confirms the update.
+        assert!(
+            log.get(1)
+                .is_some_and(|(_, body)| body.contains("ok: dashboard charts updated for 2025")),
+            "tool result missing: {log:?}"
+        );
+        drop(log);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn chat_rejects_invalid_render_dashboard() {
+        let (dir, db) = temp_db();
+        seed_transactions(&db);
+        // 'unknown' is not in the seeded taxonomy, so the update must be
+        // rejected and no chart event must be streamed.
+        let args = serde_json::json!({
+            "year": 2025,
+            "label": "2025",
+            "categories": [{ "name": "unknown", "value": 1.0 }]
+        });
+        let (base, hits, log) = mock_llm_server(vec![
+            openai_render_sse(&args),
+            openai_text_sse("The category does not exist."),
+        ])
+        .await;
+        let chat = chat_at(db.clone(), spend_core::config::LlmProvider::Local, base);
+        let app = app(AppState {
+            db_path: db,
+            fx: spend_core::fx::Fx::new("http://127.0.0.1:1"),
+            chat,
+        });
+        let (status, sse) = post_chat(&app, &serde_json::json!({ "message": "Show food" })).await;
+        assert_eq!(status, StatusCode::OK, "body: {sse}");
+        assert!(!sse.contains("event: chart"), "body: {sse}");
+        assert!(sse.contains("The category does not exist."), "body: {sse}");
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "expected exactly two model round trips"
+        );
+        let log = log.lock().unwrap();
+        assert!(
+            log.get(1)
+                .is_some_and(|(_, body)| body.contains("rejected: unknown category 'unknown'")),
+            "tool result missing: {log:?}"
+        );
+        drop(log);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn chat_streams_chart_update_gemini() {
+        let (dir, db) = temp_db();
+        seed_transactions(&db);
+        let args = serde_json::json!({
+            "year": 2025,
+            "label": "2025",
+            "yearly": [{ "year": 2025, "value": 425.75 }]
+        });
+        let (base, hits, _log) = mock_llm_server(vec![
+            gemini_render_sse(&args),
+            gemini_text_sse("Yearly totals on the dashboard."),
+        ])
+        .await;
+        let chat = chat_at(db.clone(), spend_core::config::LlmProvider::Gemini, base);
+        let app = app(AppState {
+            db_path: db,
+            fx: spend_core::fx::Fx::new("http://127.0.0.1:1"),
+            chat,
+        });
+        let (status, sse) = post_chat(&app, &serde_json::json!({ "message": "Show yearly" })).await;
+        assert_eq!(status, StatusCode::OK, "body: {sse}");
+        assert!(sse.contains("event: chart"), "body: {sse}");
+        assert!(sse.contains("\"value\":425.75"), "body: {sse}");
+        assert!(
+            sse.contains("Yearly totals on the dashboard."),
+            "body: {sse}"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "expected exactly two model round trips"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
