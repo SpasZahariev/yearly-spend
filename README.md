@@ -34,13 +34,12 @@ All captures are 1920×1080 viewport, full-page (`images/`).
 | **LLM / FX** | Local `llama-server` (OpenAI-compatible `/v1/chat/completions` SSE) or Gemini (`streamGenerateContent` SSE) — selected via `.env`; Frankfurter for FX monthly averages + spot (cached in `fx_rates`) |
 | **Tooling** | `just` task runner, `cargo fmt/clippy/test` (`-D warnings`, `unsafe_code = "forbid"`), `pnpm lint/format/build`, `cargo` workspace, `reqwest` + `sqlparser` (DuckDB dialect + lexical WITH-tail guard), `tower-http` |
 
-## Highlights for reviewers
+## Highlights 
 
 * **Full-stack ownership** — Rust API serving a Vite SPA from the same binary, shared `spend-core` crate, end-to-end type safety from DuckDB to Recharts.
 * **LLM as data tool, not narrator** — `run_sql` is SELECT-only (sqlparser + CTE-tail guard, read-only connection, 100 rows / 8 rounds), every ingest batch is audited in `llm_calls`, taxonomy is validated; `render_dashboard` is JSON-schema validated and merges over live API data per year.
 * **Conversational memory** — frontend sends the last 20 turns (`{role, content}`) with every `ask`; backend replays `history` before the new user message for both Local (OpenAI `messages`) and Gemini (`contents`) so follow-ups (“what about last year?”) work without server state.
 * **Security & correctness** — `unsafe_code = "forbid"`, read-only connections by default, short-lived read-write only for `PATCH`, FX and ingest are idempotent (file SHA + `UNIQUE(source, source_key)`).
-* **Pixel-perfect UX** — 2px borders, square corners, `Space Grotesk`/`Inter`, Sankey category filtering driven by chat (top-N → N outflows), currency/view/year/month pickers auto-sync from `render_dashboard` (`currency`, `month`, `view`, `sankey`).
 
 ## Setup
 
